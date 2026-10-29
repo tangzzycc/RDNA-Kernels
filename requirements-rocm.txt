@@ -1,0 +1,3 @@
+--extra-index-url https://stable.repo.amd.com/rocm/whl-next/
+
+rocm[libraries,devel,device-gfx1151,profiler]==10.1.0
