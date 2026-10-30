@@ -1,5 +1,3 @@
-这个
-
 # Qwen3-32B
 
 <p align="center">
@@ -16,6 +14,8 @@ Q 投影将特征维度从 `5120` 扩展到 `8192`，拆分为 `64 × 128`；K/V
 
 以下以单 GPU、BF16 推理为基准，函数签名约定本项目的数据布局。`sampler` 参数由生成请求决定；`quant` 及量化融合算子用于可选的量化部署。采样与缓存操作参考 [vLLM sampler](https://github.com/vllm-project/vllm/blob/main/vllm/v1/sample/sampler.py) 和 [attention backend](https://github.com/vllm-project/vllm/tree/main/vllm/v1/attention/backends)。
 
+下文 `⊙` 表示逐元素乘法，向量公式按行独立应用。
+
 ## norm
 
 ### rmsnorm
@@ -25,18 +25,18 @@ Q 投影将特征维度从 `5120` 扩展到 `8192`，拆分为 `64 × 128`；K/V
 RMSNorm 沿最后一维计算均方根并归一化，再乘以可学习的缩放权重 `gamma`：
 
 $$
-r_m = \left(\frac{1}{N}\sum_{j=0}^{N-1}x_{m,j}^{2}+\epsilon\right)^{-\frac{1}{2}},
+r = \sqrt{\frac{1}{N}\sum_{i=0}^{N-1}x_i^2+\epsilon},
 \qquad
-y_{m,n}=x_{m,n}\,r_m\,\gamma_n
+y_i = \frac{x_i}{r}\gamma_i
 $$
 
-每一行独立归一化，所有行共享同一组缩放权重。RMSNorm 不减去均值，也没有额外的偏置项。
+`x` 表示一行长度为 `N` 的特征向量，`r` 为加入数值稳定项后的均方根。每一行独立归一化，所有行共享同一组缩放权重。RMSNorm 不减去均值，也没有额外的偏置项。
 
 输入 `x` 与输出 `y` 的 shape 均为 `[B,S,5120]`，展平前两维后按 `[M,N]` 处理，其中 `M=B×S`、`N=5120`。`gamma` 的 shape 为 `[N]`，沿最后一维广播。单 token decode 时 `S=1`，因此 `M=B`。
 
 Q/K 的 head 内归一化复用同一算子：`N=128`，Q 的行数为 `B×S×64`，K 的行数为 `B×S×8`，两者分别使用一组 `[128]` 的权重。
 
-平方和、均值和归一化因子使用 FP32 计算。为与 Qwen3 的 BF16 参考实现对齐，`x * r` 的结果先转换为 BF16，再与 BF16 的 `gamma` 相乘，得到 BF16 输出。
+平方和、均值和归一化因子使用 FP32 计算。为与 Qwen3 的 BF16 参考实现对齐，归一化结果先转换为 BF16，再与 BF16 的 `gamma` 相乘，得到 BF16 输出。
 
 HIP kernel 函数签名：
 
@@ -54,14 +54,10 @@ __global__ void rmsnorm_kernel(const hip_bfloat16* x, const hip_bfloat16* gamma,
 融合残差加法与 RMSNorm，对应 Qwen3 的 Attention 输出后、层间和模型末尾的归一化：
 
 $$
-\begin{aligned}
-s_{m,n} &= x_{m,n} + \mathrm{residual}_{m,n}, \\
-r_m &= \left(\frac{1}{N}\sum_{j=0}^{N-1}s_{m,j}^{2}+\epsilon\right)^{-\frac{1}{2}}, \\
-y_{m,n} &= s_{m,n}\,r_m\,\gamma_n.
-\end{aligned}
+s = x+r,\qquad y = \mathrm{RMSNorm}(s,\gamma,\epsilon)
 $$
 
-`x`、`residual` 与两路输出均为 `[M,N]`，`gamma` 为 `[N]`。原地写回 `x ← y`、`residual ← s`，其中 `s` 保留给后续残差连接使用。
+`r` 表示输入残差，`s` 表示相加后的隐藏状态。`x`、`residual` 与两路输出均为 `[M,N]`，`gamma` 为 `[N]`。原地写回 `x ← y`、`residual ← s`，其中 `s` 保留给后续残差连接使用。
 
 残差相加结果先舍入为 BF16，后续归一化沿用上述 RMSNorm 的 FP32 计算与 BF16 舍入约定。
 
@@ -84,10 +80,10 @@ __global__ void add_rmsnorm_kernel(hip_bfloat16* x, hip_bfloat16* residual,
 逐元素相加，对应 Attention/MLP 输出与残差相加：
 
 $$
-y_i = a_i+b_i
+y = a+b
 $$
 
-模型输入输出均为 `[M,5120]`。输入输出使用 BF16，FP32 加法结果舍入为 BF16；`add.hip` 使用同一接口，也支持任意长度的连续数组。
+模型输入输出均为 `[M,5120]`。输入输出使用 BF16，FP32 加法结果舍入为 BF16。
 
 HIP kernel 函数签名：
 
@@ -103,7 +99,7 @@ __global__ void add_kernel(const hip_bfloat16* a, const hip_bfloat16* b,
 SiLU 对输入逐元素计算激活，对应 Qwen3 MLP 中 `gate_proj` 输出后的激活：
 
 $$
-y_i = \operatorname{SiLU}(x_i) = \frac{x_i}{1+e^{-x_i}}
+y = \mathrm{SiLU}(x) = \frac{x}{1+e^{-x}}
 $$
 
 输入 `x` 与输出 `y` 均为 `[M,25600]`，其中 `M=B×S`，展平后按连续数组处理。使用 BF16 存储，激活值使用 FP32 计算，结果转换为 BF16。
@@ -121,7 +117,7 @@ __global__ void silu_kernel(const hip_bfloat16* x, hip_bfloat16* y, size_t n);
 逐元素相乘，对应 Qwen3 MLP 中 SiLU 的输出与 `up_proj` 输出相乘：
 
 $$
-y_i = a_i\,b_i
+y = a\odot b
 $$
 
 输入 `a`、`b` 与输出 `y` 均为 `[M,25600]`，展平后按连续数组处理。使用 BF16 存储，乘法使用 FP32 计算，结果转换为 BF16。
@@ -140,8 +136,7 @@ __global__ void mul_kernel(const hip_bfloat16* a, const hip_bfloat16* b,
 融合 SiLU 与逐元素乘法，完成 Qwen3 MLP 的门控激活，输出送入 `down_proj`：
 
 $$
-y_i = \operatorname{SiLU}(\mathrm{gate}_i)\,\mathrm{up}_i
-    = \frac{\mathrm{gate}_i}{1+e^{-\mathrm{gate}_i}}\,\mathrm{up}_i
+y = \mathrm{SiLU}(\mathrm{gate})\odot\mathrm{up}
 $$
 
 `gate`、`up` 分别来自 `gate_proj`、`up_proj`，与输出 `y` 的 shape 均为 `[M,25600]`。沿用单独 SiLU 后接乘法的 BF16 精度约定：SiLU 使用 FP32 计算，其结果先舍入为 BF16，再与 BF16 的 `up` 相乘，得到 BF16 输出。
@@ -158,17 +153,17 @@ __global__ void silu_mul_kernel(const hip_bfloat16* gate,
 
 ### softmax
 
-Softmax 沿最后一维将分数归一化为概率，用于 Attention 权重计算和采样。每行包含最大值和求和归约，先减去最大值以提高数值稳定性：
+Softmax 沿最后一维将一行分数归一化为概率，用于 Attention 权重计算和采样：
 
 $$
-a_m = \max_{0\le j<N}x_{m,j},
+m = \max_j x_j,
 \qquad
-y_{m,n} = \frac{e^{x_{m,n}-a_m}}{\sum_{j=0}^{N-1}e^{x_{m,j}-a_m}}
+y_i = \frac{e^{x_i-m}}{\sum_j e^{x_j-m}}
 $$
 
 输入 `x` 与输出 `y` 均为 `[M,N]`。对于 Qwen3-32B 的 Attention scores，`[B,64,S,L]` 展平为 `[B×64×S,L]`，沿 KV 上下文维度 `L` 归一化。
 
-Attention 的独立 Softmax 接口使用 BF16 输入输出，采样接口使用 FP32 输入输出。最大值、指数和求和均使用 FP32 计算；每行至少有一个有限的分数。
+`m` 为该行最大值，减去 `m` 可提高数值稳定性，且不改变概率分布。Attention 的独立 Softmax 接口使用 BF16 输入输出，采样接口使用 FP32 输入输出。最大值、指数和求和均使用 FP32 计算；每行至少有一个有限的分数。
 
 HIP kernel 函数签名：
 
@@ -192,7 +187,7 @@ GEMM 计算矩阵乘积，对应 Qwen3 中的各个线性投影：
 $$
 C = AB,
 \qquad
-C_{m,n} = \sum_{j=0}^{K-1}A_{m,j}\,B_{j,n}
+C_{i,j} = \sum_{t=0}^{K-1}A_{i,t}B_{t,j}
 $$
 
 输入 `a` 为 `[M,K]`、`b` 为 `[K,N]`，输出 `c` 为 `[M,N]`，均按行连续存储。线性投影中 `M` 为本次处理的 token 数，各投影的 `(K,N)` 为：
@@ -220,7 +215,7 @@ GEMV 计算矩阵与向量的乘积，对应单个 token 的线性投影：
 $$
 y = Wx,
 \qquad
-y_n = \sum_{j=0}^{K-1}W_{n,j}\,x_j
+y_i = \sum_{j=0}^{K-1}W_{i,j}x_j
 $$
 
 权重 `weight` 为 `[N,K]`，输入 `x` 为 `[K]`，输出 `y` 为 `[N]`。权重沿用 PyTorch Linear 的行主序布局；输入输出使用 BF16，乘加使用 FP32 累加，结果转换为 BF16。
@@ -241,15 +236,26 @@ __global__ void gemv_kernel(const hip_bfloat16* weight, const hip_bfloat16* x,
 
 ### rope
 
-RoPE 对 Q/K 应用旋转位置编码，按每个 head 的前后半维配对。`F` 为 head 维度的一半，配对索引满足 `0≤i<F`；`Θ` 为 RoPE 基数，`p` 为 token 位置。Qwen3 取 `D=128`、`F=64`、`Θ=1000000`：
+RoPE 对 Q/K 应用旋转位置编码，将每个 head 的前后半维对应元素配成一对，执行二维旋转：
 
 $$
-\begin{aligned}
-\theta_{p,i} &= p\,\Theta^{-i/F}, \\
-x'_i &= x_i\cos\theta_{p,i}-x_{i+F}\sin\theta_{p,i}, \\
-x'_{i+F} &= x_i\sin\theta_{p,i}+x_{i+F}\cos\theta_{p,i}.
-\end{aligned}
+\theta = p\Theta^{-i/F},
+\qquad
+\begin{pmatrix}
+x'_a\\
+x'_b
+\end{pmatrix}
+= \begin{pmatrix}
+\cos\theta & -\sin\theta\\
+\sin\theta & \cos\theta
+\end{pmatrix}
+\begin{pmatrix}
+x_a\\
+x_b
+\end{pmatrix}
 $$
+
+`x_a`、`x_b` 对应维度 `i`、`i+F`，`F` 为 head 维度的一半。`θ` 为旋转角度，`p` 为 token 位置，`Θ` 为 RoPE 基数，`0≤i<F`；Qwen3 取 `D=128`、`F=64`、`Θ=1000000`。
 
 输入 `x` 按 `[T,H,128]` 连续存储并原地写回，其中 `T=B×S`，Q 使用 `H=64`，K 使用 `H=8`。`positions` 为 `[T]`，保存各 token 的位置；预计算的 `cos`、`sin` 均为 `[P,64]`，`P` 为位置表长度，同一位置的系数由所有 heads 共享。
 
@@ -272,9 +278,7 @@ __global__ void rope_kernel(hip_bfloat16* x, const int64_t* positions,
 在一次 kernel 调用中同时旋转 Q/K，共享位置索引与 cos/sin：
 
 $$
-Q' = \operatorname{RoPE}(Q),
-\qquad
-K' = \operatorname{RoPE}(K)
+Q' = \mathrm{RoPE}(Q),\qquad K' = \mathrm{RoPE}(K)
 $$
 
 `q` 为 `[T,64,128]`，`k` 为 `[T,8,128]`，均按 token/head/维度连续存储并原地写回。位置表、旋转公式与精度约定沿用 `rope`。
@@ -298,14 +302,10 @@ __global__ void qk_rope_kernel(hip_bfloat16* q, hip_bfloat16* k,
 将旋转后的 K 与原始 V 写入当前 token 对应的缓存槽位：
 
 $$
-\mathrm{KCache}_{s_t}=K_t,
-\qquad
-\mathrm{VCache}_{s_t}=V_t,
-\qquad
-s_t=\mathrm{slot\_mapping}_t
+K_{\mathrm{cache}}[s] = K,\qquad V_{\mathrm{cache}}[s] = V
 $$
 
-K/V 输入为 `[T,8,128]`，缓存为 `[C,8,128]`。分页时也可将同一缓存视为 `[num_blocks,block_size,8,128]`，`C=num_blocks×block_size`；物理槽位为 `block_id×block_size+offset`。数据使用 BF16。
+公式表示单个 token 的写入，`s` 为 `slot_mapping` 给出的缓存槽位。K/V 输入为 `[T,8,128]`，缓存为 `[C,8,128]`。分页时也可将同一缓存视为 `[num_blocks,block_size,8,128]`，`C=num_blocks×block_size`；物理槽位为 `block_id×block_size+offset`。数据使用 BF16。
 
 HIP kernel 函数签名：
 
@@ -322,14 +322,13 @@ __global__ void cache_write_kernel(const hip_bfloat16* k, const hip_bfloat16* v,
 
 ### qk_rope_cache
 
-融合 Q/K 的 RoPE 与 K/V 缓存写入。token `t` 的位置为 `p_t = positions[t]`，缓存槽位为 `s_t = slot_mapping[t]`：
+融合 Q/K 的 RoPE 与 K/V 缓存写入。对每个 token，使用 `positions` 确定旋转角度，使用 `slot_mapping` 确定缓存槽位 `s`：
 
 $$
 \begin{aligned}
-Q'_t &= \operatorname{RoPE}(Q_t,p_t), &
-K'_t &= \operatorname{RoPE}(K_t,p_t), \\
-\mathrm{KCache}_{s_t} &= K'_t, &
-\mathrm{VCache}_{s_t} &= V_t.
+Q' &= \mathrm{RoPE}(Q),\\
+K_{\mathrm{cache}}[s] &= \mathrm{RoPE}(K),\\
+V_{\mathrm{cache}}[s] &= V.
 \end{aligned}
 $$
 
@@ -358,19 +357,19 @@ __global__ void qk_rope_cache_kernel(
 
 ### attention
 
-缩放点积注意力，使用 Qwen3 的 GQA 与 causal mask：
+缩放点积注意力，使用 Qwen3 的 GQA 与 causal mask。计算点积分数 `Z`，经 Softmax 得到权重 `P`，再对 V 加权求和：
 
 $$
 \begin{aligned}
-G&=\frac{H_q}{H_{kv}}, &
-g(h)&=\left\lfloor\frac{h}{G}\right\rfloor, \\
-Z_{b,h,i,j}&=\frac{Q_{b,h,i}\cdot K_{b,g(h),j}}{\sqrt{D}}+\mathrm{mask}_{b,i,j}, \\
-P_{b,h,i,:}&=\operatorname{softmax}(Z_{b,h,i,:}), &
-O_{b,h,i}&=\sum_j P_{b,h,i,j}\,V_{b,g(h),j}.
+Z &= \frac{QK^{\mathsf T}}{\sqrt{D}}+M,\\
+P &= \mathrm{softmax}(Z),\\
+O &= PV.
 \end{aligned}
 $$
 
-Q 为 `[B,64,S,128]`，K/V 为 `[B,8,L,128]`，输出为 `[B,64,S,128]`。每 8 个 Q heads 共享一个 KV head。请求 `b` 的有效上下文长度为 `context_lens[b]`，当前查询块起点为 `query_start[b]`；查询 `i` 可访问 `j<context_lens[b]` 且 `j≤query_start[b]+i` 的 key，其余分数置为负无穷。
+公式按一个 head 表示：Q 为 `[S,D]`，K/V 为 `[L,D]`，Z/P 为 `[S,L]`，输出 O 为 `[S,D]`；Softmax 沿 KV 长度 `L` 计算。`M` 为 `[S,L]` 的 causal mask，允许位置取零，其余取负无穷。
+
+完整 Q 为 `[B,64,S,128]`，K/V 为 `[B,8,L,128]`，输出为 `[B,64,S,128]`。每 8 个 Q heads 共享一个 KV head。请求 `b` 的有效上下文长度为 `context_lens[b]`，当前查询块起点为 `query_start[b]`；查询 `i` 可访问 `j<context_lens[b]` 且 `j≤query_start[b]+i` 的 key，其余分数置为负无穷。
 
 Q/K 已完成 head 内 RMSNorm 与 RoPE。输入输出使用 BF16，点积、Softmax 和加权求和使用 FP32；融合计算与拆分参考的中间 BF16 舍入可能产生数值差异。
 
@@ -395,19 +394,13 @@ __global__ void attention_kernel(const hip_bfloat16* q, const hip_bfloat16* k,
 
 ### flash_attention
 
-分块计算 Attention，并在线维护 Softmax 的最大值、指数和与加权和，避免完整写出 `[B,64,S,L]` 的分数和概率矩阵：
+Flash Attention 的数学定义与普通 Attention 相同，通过分块和在线 Softmax 完成融合计算：
 
 $$
-m=\max_j z_j,
-\qquad
-\ell=\sum_j e^{z_j-m},
-\qquad
-u=\sum_j e^{z_j-m}V_j,
-\qquad
-O=\frac{u}{\ell}
+O = \mathrm{softmax}\left(\frac{QK^{\mathsf T}}{\sqrt{D}}+M\right)V
 $$
 
-上述统计针对单个 query/head，`z_j` 为其分数，`V_j` 来自对应的 KV head。输入输出布局、GQA 和 causal 规则沿用 `attention`。在线统计与加权累积使用 FP32，输出使用 BF16；接口同时覆盖 prefill 与 `S=1` 的 decode。
+避免完整写出 `[B,64,S,L]` 的分数和概率矩阵。输入输出布局、GQA 和 causal 规则沿用 `attention`；计算与累加使用 FP32，输出使用 BF16，接口同时覆盖 prefill 与 `S=1` 的 decode。
 
 HIP kernel 函数签名：
 
@@ -426,16 +419,13 @@ __global__ void flash_attention_kernel(
 
 ### paged_attention
 
-通过 block table 访问分页 KV cache，计算与 `attention` 相同的 GQA 注意力。逻辑 key 位置 `j` 对应的物理页与页内偏移为：
+Paged Attention 通过 block table 从分页 KV cache 读取逻辑 K/V，再计算相同的注意力：
 
 $$
-\mathrm{block}_{b,j}
-=\mathrm{block\_table}_{b,\lfloor j/P_b\rfloor},
-\qquad
-\mathrm{offset}_j=j\bmod P_b
+O = \mathrm{softmax}\left(\frac{QK^{\mathsf T}}{\sqrt{D}}+M\right)V
 $$
 
-Q 与输出为 `[B,64,S,128]`；K/V cache 为 `[num_blocks,P_b,8,128]`，`P_b` 为 block size。缓存布局与 `cache_write` 的平面槽位布局对应。每个请求的有效长度与 causal 范围沿用 `attention`；`S=1` 时直接对历史缓存执行 decode。
+公式中的 K/V 表示按 token 顺序读取的逻辑矩阵，`M` 沿用 `attention` 的 causal mask。Q 与输出为 `[B,64,S,128]`；K/V cache 为 `[num_blocks,block_size,8,128]`。缓存布局与 `cache_write` 的平面槽位布局对应。每个请求的有效长度与 causal 范围沿用 `attention`；`S=1` 时直接对历史缓存执行 decode。
 
 BF16 数据读取后使用 FP32 计算分数、Softmax 与加权和，输出转换为 BF16。
 
@@ -466,7 +456,7 @@ __global__ void paged_attention_kernel(
 用温度调整 logits：
 
 $$
-L'_{r,v}=\frac{L_{r,v}}{\tau_r}
+L' = L/\tau
 $$
 
 输入输出均为 `[R,V]`，原地更新，使用 FP32。`τ>0`；温度为 0 的请求使用 `greedy`。
@@ -483,18 +473,19 @@ __global__ void temperature_kernel(float* logits, const float* temperatures,
 
 ### penalties
 
-合并 repetition、frequency 与 presence penalty，系数分别为 `ρ`、`f`、`a`。`c` 为已生成 token 的出现次数，`seen` 表示 token 在 prompt 或已生成序列中出现过：
+合并 repetition、frequency 与 presence penalty，系数分别为 `ρ`、`f`、`a`。先对历史中出现过的 token 按 logit 正负应用重复惩罚，再减去频率与存在惩罚：
 
 $$
-\widetilde L_{r,v}=
+L_{\mathrm{rep}}=
 \begin{cases}
-L_{r,v}/\rho_r,&\mathrm{seen}_{r,v}\land L_{r,v}>0,\\
-L_{r,v}\rho_r,&\mathrm{seen}_{r,v}\land L_{r,v}\le0,\\
-L_{r,v},&\neg\mathrm{seen}_{r,v},
+L/\rho,&L\gt0,\\
+\rho L,&L\le0,
 \end{cases}
 \qquad
-L'_{r,v}=\widetilde L_{r,v}-f_r c_{r,v}-a_r\mathbf{1}[c_{r,v}>0]
+L' = L_{\mathrm{rep}}-fc-a\mathbf{1}[c\gt0]
 $$
+
+公式描述单个 token 的 logit `L`；未在历史中出现时取 `L_rep=L`。`c` 为已生成 token 的出现次数，指示项在 `c>0` 时取 1，否则取 0。
 
 logits 原地更新为 `[R,V]`。重复惩罚使用 prompt 与生成历史的并集，频率和存在惩罚使用生成历史。计算使用 FP32；`ρ=1`、`f=a=0` 表示关闭对应惩罚。
 
@@ -517,7 +508,7 @@ __global__ void penalties_kernel(float* logits, const uint8_t* prompt_seen,
 选择每行最大 logit 对应的 token：
 
 $$
-\mathrm{token}_r=\operatorname*{arg\,max}_{0\le v<V}L_{r,v}
+\mathrm{token} = \mathrm{argmax}_i L_i
 $$
 
 输入为 `[R,V]` 的 FP32 logits，输出为 `[R]` 的 token ID。值相同时选择较小的 token ID。
@@ -534,11 +525,12 @@ __global__ void greedy_kernel(const float* logits, int64_t* token_ids, int rows,
 
 ### top_k
 
-保留每行分数最高的 `k` 个 token，其余 logits 置为负无穷：
+`S_k` 为一行中分数最高的 `k` 个 token 的集合。保留这些 token 的 logits，其余置为负无穷：
 
 $$
-L'_{r,v}=\begin{cases}
-L_{r,v},&v\in\operatorname{TopK}(L_r,k_r),\\
+L'_i=
+\begin{cases}
+L_i,&i\in S_k,\\
 -\infty,&\text{其余 token}.
 \end{cases}
 $$
@@ -557,21 +549,15 @@ __global__ void top_k_kernel(const float* logits, const int32_t* top_k,
 
 ### top_p
 
-按概率降序选择累计概率达到阈值的最短前缀，并重新归一化：
+将一行已归一化的概率按降序排列为 `P_1,…,P_V`，选择累计概率首次达到阈值 `p` 的前 `k` 个 token，并重新归一化：
 
 $$
-t_r=\sum_{v=0}^{V-1}P_{r,v},
+\sum_{i=1}^{k}P_i\ge p,
 \qquad
-k_r=\min\left\{k\ge1:\sum_{i=0}^{k-1}P_{r,\pi_i}\ge p_r t_r\right\},
-\qquad
-Q_{r,v}=\begin{cases}
-\displaystyle\frac{P_{r,v}}{\sum_{i=0}^{k_r-1}P_{r,\pi_i}},
-&v\in\{\pi_0,\ldots,\pi_{k_r-1}\},\\
-0,&\text{其余 token}.
-\end{cases}
+P'_i = \frac{P_i}{\sum_{j=1}^{k}P_j}
 $$
 
-`π` 按概率降序排列，并列时按 token ID 升序排列。输入输出均为 `[R,V]` 的 FP32 概率，输出保持原词表顺序；`0<p≤1`，包含跨过阈值的那个 token。阈值按每行总质量 `t` 计算，避免归一化的舍入误差。
+取满足条件的最小 `k`；保留的 token 按上式归一化，其余概率置零。并列概率按 token ID 升序排列。输入输出均为 `[R,V]` 的 FP32 概率，输出恢复原词表顺序；`0<p≤1`，包含跨过阈值的那个 token。实现时用 `p` 乘实际总质量作为阈值，处理 FP32 的归一化舍入误差。
 
 HIP kernel 函数签名：
 
@@ -585,16 +571,15 @@ __global__ void top_p_kernel(const float* probs, const float* top_p,
 
 ### sample
 
-按每行概率分布采样 token，使用均匀随机数查找累积分布：
+按每行概率分布随机采样 token：
 
 $$
-F_{r,j}=\frac{\sum_{v=0}^{j}P_{r,v}}{\sum_{v=0}^{V-1}P_{r,v}},
+F_i = \sum_{j=0}^{i}P_j,
 \qquad
-\mathrm{token}_r=\min\{j:F_{r,j}>u_r\},
-\quad u_r\sim\mathcal{U}[0,1)
+\mathrm{token} = \min\lbrace i:F_i\gt u\rbrace
 $$
 
-输入权重为 `[R,V]`，随机数和输出 token ID 均为 `[R]`。权重非负且每行总质量大于 0；随机数由调用方提供，计算使用 FP32。
+`P_i` 为 token `i` 的采样概率，`F_i` 为截至该 token 的累计概率，`u` 为调用方提供的均匀随机数。输入权重为 `[R,V]`，非负且每行总质量大于 0，按行归一化得到 `P`。调用方提供 `[0,1)` 的均匀随机数，选择累计概率首次大于该随机数的 token；随机数与输出 token ID 均为 `[R]`，计算使用 FP32。
 
 HIP kernel 函数签名：
 
@@ -611,10 +596,11 @@ __global__ void sample_kernel(const float* probs, const float* uniforms,
 融合温度、Top-k、Softmax、Top-p 与随机采样：
 
 $$
-Q=\operatorname{TopP}\left(
-\operatorname{softmax}\left(\operatorname{TopK}(L/\tau,k)\right),p\right),
-\qquad
-\mathrm{token}\sim\operatorname{Categorical}(Q)
+\begin{aligned}
+L' &= L/\tau, & \widehat L &= \mathrm{TopK}(L',k),\\
+P &= \mathrm{softmax}(\widehat L), & P' &= \mathrm{TopP}(P,p),\\
+\mathrm{token} &\sim \mathrm{Categorical}(P').
+\end{aligned}
 $$
 
 输入为 `[R,V]` 的 FP32 logits，输出为 `[R]` 的 token ID。先完成所需惩罚，再调用此融合算子；筛选、并列值与随机数规则沿用上述算子。温度为 0 的行返回 greedy 结果。
@@ -640,33 +626,25 @@ INT8 以 [SmoothQuant](https://github.com/mit-han-lab/smoothquant) 的 W8A8 路�
 
 ### quant_int8
 
-SmoothQuant 通过通道缩放，将激活中的异常值幅度转移到权重。`a_k` 为校准激活的逐通道最大绝对值，`b_k` 为对应权重列的最大绝对值，`α` 控制两者的平衡：
+SmoothQuant 通过通道缩放，将激活中的异常值幅度转移到权重。对单个输入通道，`a` 为校准激活的最大绝对值，`b` 为对应权重列的最大绝对值，`α` 控制两者的平衡：
 
 $$
-\begin{aligned}
-d_k &= \frac{a_k^{\alpha}}{b_k^{1-\alpha}}, \\
-\widetilde X_{m,k} &= X_{m,k}/d_k, &
-\widetilde W_{n,k} &= W_{n,k}\,d_k, \\
-XW^{\mathsf T} &= \widetilde X\widetilde W^{\mathsf T}.
-\end{aligned}
+d = \frac{a^{\alpha}}{b^{1-\alpha}},\qquad \widetilde x = x/d,\qquad \widetilde w = wd
 $$
 
-`d` 为 `[K]` 的离线通道尺度，`0≤α≤1`；计算时用正数 `δ` 约束分母与尺度下界。权重缩放后离线量化，激活在推理时按行动态量化：
+上述变换按输入通道分别应用，两项缩放相互抵消。`d` 为 `[K]` 的离线通道尺度，`0≤α≤1`；计算时用正数 `δ` 约束分母与尺度下界。权重缩放后离线量化；推理时，将缩放后的单行激活记为 `u`，按最大绝对值动态量化：
 
 $$
-u_{r,j}=x_{r,j}/d_j,
+s = \frac{\max_i|u_i|}{q_{\max}},
 \qquad
-a_r=\max_j|u_{r,j}|,
+q_i = \mathrm{clip}\left(\mathrm{round}(u_i/s),-q_{\max},q_{\max}\right),
 \qquad
-s_r=\frac{a_r}{q_{\max}},
-\qquad
-q_{r,j}=\operatorname{clip}\left(
-\operatorname{RNE}(u_{r,j}/s_r),-q_{\max},q_{\max}\right)
+\widehat u_i = sq_i
 $$
 
-`RNE` 表示就近舍入，并列时取偶数。`q_max=127`，全零行取 `s=1`。激活输入为 `[M,K]` 的 BF16，输出为同 shape 的 INT8，动态尺度为 `[M]`；缩放与量化使用 FP32。缩放后的权重 `[N,K]` 也按行量化，其尺度为 `[N]`。
+`round` 采用最近偶数舍入（RNE），`clip` 将结果限制在量化范围内。`q_max=127`，全零行取 `s=1`。激活输入为 `[M,K]` 的 BF16，输出为同 shape 的 INT8，动态尺度为 `[M]`；缩放与量化使用 FP32。缩放后的权重 `[N,K]` 也按行量化，其尺度为 `[N]`。
 
-若通道缩放已吸收到前序算子，或输入是已缩放的权重，则直接令 `u=x`，避免重复缩放。`d` 是离线通道尺度，`s` 是量化尺度，两者用途不同。
+`û` 为由量化值和尺度恢复的近似激活。若通道缩放已吸收到前序算子，或输入是已缩放的权重，则直接令 `u=x`，避免重复缩放。`d` 是离线通道尺度，`s` 是量化尺度，两者用途不同。
 
 HIP kernel 函数签名：
 
@@ -685,19 +663,15 @@ __global__ void quant_int8_kernel(const hip_bfloat16* x,
 
 AWQ 利用激活统计搜索通道缩放与权重裁剪，GPTQ 利用近似二阶信息逐列量化并补偿误差。两者的分组 INT4 权重均可表示为量化值 `q`、尺度 `s` 与零点 `z`。
 
-按离线流程给定的组尺度与零点，将权重编码为 INT4：
+对一组权重 `w`，使用离线流程给定的尺度 `s` 与零点 `z` 编码为 INT4：
 
 $$
-g=\left\lfloor\frac{j}{G_s}\right\rfloor,
+q_i = \mathrm{clip}\left(\mathrm{round}(w_i/s)+z,q_{\min},q_{\max}\right),
 \qquad
-\begin{aligned}
-q_{n,j} &= \operatorname{clip}\left(
-\operatorname{RNE}(W^{\star}_{n,j}/s_{n,g})+z_{n,g},q_{\min},q_{\max}\right), \\
-\widehat W_{n,j} &= s_{n,g}(q_{n,j}-z_{n,g}).
-\end{aligned}
+\widehat w_i = s(q_i-z)
 $$
 
-`W*` 表示送入舍入步骤的权重，已完成 AWQ 的缩放/裁剪或 GPTQ 在该步骤之前的误差补偿。此接口执行给定参数下的编码与打包；已量化模型直接加载其量化值和参数。
+`w` 已完成 AWQ 的缩放/裁剪或 GPTQ 在舍入前的误差补偿。`round` 沿用最近偶数舍入，`clip` 将结果限制在量化范围内；反量化按 `ŵ=s(q−z)` 恢复权重。此接口执行编码与打包，已量化模型直接加载其量化值和参数。
 
 采用连续分组，GPTQ 先以关闭 act-order 的配置为例。组宽为 `G_s`，通常取 128；权重为 `[N,K]`，尺度与零点为 `[N,K/G_s]`，打包输出为 `[N,K/2]`。INT4 取 `q_min=0`、`q_max=15`；GPTQ 的对称量化也可用固定零点表示。每字节低 4 位存偶数列，高 4 位存奇数列。
 
@@ -719,9 +693,7 @@ __global__ void quant_int4_kernel(const float* weight, const float* scales,
 融合 RMSNorm 与逐行 INT8 量化，用于量化 Linear 前的激活处理：
 
 $$
-Y = \operatorname{RMSNorm}(X,\gamma,\epsilon),
-\qquad
-(Q,s) = \operatorname{QuantINT8}(Y)
+y = \mathrm{RMSNorm}(x,\gamma,\epsilon),\qquad (q,s) = \mathrm{QuantINT8}(y)
 $$
 
 `x`、量化输出 `q` 均为 `[M,N]`，`gamma` 为 `[N]`，`scales` 为 `[M]`。归一化沿用 `rmsnorm` 的 BF16 舍入约定，量化采用 `quant_int8` 的逐行对称规则。用于 SmoothQuant 时，通道缩放预先吸收到 `gamma`，配套 Linear 的权重同步变换。
@@ -744,12 +716,14 @@ __global__ void rmsnorm_quant_kernel(const hip_bfloat16* x,
 融合残差加法、RMSNorm 与逐行 INT8 量化：
 
 $$
-R' = \operatorname{BF16}(X+R),
-\qquad
-(Q,s) = \operatorname{QuantINT8}(\operatorname{RMSNorm}(R',\gamma,\epsilon))
+\begin{aligned}
+r' &= x+r,\\
+y &= \mathrm{RMSNorm}(r',\gamma,\epsilon),\\
+(q,s) &= \mathrm{QuantINT8}(y).
+\end{aligned}
 $$
 
-`x`、`residual`、量化输出 `q` 均为 `[M,N]`。`residual` 原地写回 BF16 的 `R'`，`q` 保存 INT8 的归一化结果，`scales` 为 `[M]`。归一化与量化规则分别沿用 `add_rmsnorm`、`quant_int8`；SmoothQuant 的通道缩放可预先吸收到 `gamma`。
+`x`、`residual`、量化输出 `q` 均为 `[M,N]`。`residual` 原地写回 BF16 的 `r'`，`q` 保存 INT8 的归一化结果，`scales` 为 `[M]`。归一化与量化规则分别沿用 `add_rmsnorm`、`quant_int8`；SmoothQuant 的通道缩放可预先吸收到 `gamma`。
 
 HIP kernel 函数签名：
 
@@ -770,10 +744,12 @@ __global__ void add_rmsnorm_quant_kernel(const hip_bfloat16* x,
 使用 SmoothQuant 变换后的 INT8 激活与 INT8 权重执行 W8A8 矩阵乘法：
 
 $$
-C_{m,n}=s^A_m s^W_n\sum_j Q^A_{m,j}\,Q^W_{n,j}
+P = Q_AQ_W^{\mathsf T},
+\qquad
+C_{i,j} = s^A_i s^W_j P_{i,j}
 $$
 
-`Q^A`、`Q^W` 分别量化自缩放后的激活与权重，shape 为 `[M,K]`、`[N,K]`，量化尺度 `s^A`、`s^W` 分别为 `[M]`、`[N]`。整数乘加使用 INT32 累加，再应用 FP32 尺度，输出 BF16 的 `[M,N]`；通道缩放已在量化前完成。
+`Q_A`、`Q_W` 分别量化自缩放后的激活与权重，shape 为 `[M,K]`、`[N,K]`，量化尺度 `s^A`、`s^W` 分别为 `[M]`、`[N]`。整数矩阵乘积 `P` 使用 INT32 累加，再按行、列应用 FP32 尺度，输出 BF16 的 `[M,N]`；通道缩放已在量化前完成。
 
 HIP kernel 函数签名：
 
@@ -793,13 +769,10 @@ __global__ void gemm_int8_kernel(const int8_t* a, const int8_t* weight,
 融合 AWQ/GPTQ 的分组 INT4 权重反量化与矩阵乘法，执行 W4A16 线性投影：
 
 $$
-\widehat W_{n,j}=\operatorname{BF16}\left(
-s_{n,g}(q_{n,j}-z_{n,g})\right),
-\qquad
-C_{m,n}=\sum_j A_{m,j}\,\widehat W_{n,j}
+\widehat w_i = s(q_i-z),\qquad C = A\widehat W^{\mathsf T}
 $$
 
-激活为 `[M,K]` 的 BF16，权重打包为 `[N,K/2]`，尺度和零点为 `[N,K/G_s]`，格式与连续分组约定沿用 `quant_int4`。AWQ 的激活需完成与量化权重配套的通道缩放，可吸收到前序算子；GPTQ 使用原始激活。
+`ŵ` 表示单组反量化结果，组合得到完整权重 `Ŵ`。激活为 `[M,K]` 的 BF16，权重打包为 `[N,K/2]`，尺度和零点为 `[N,K/G_s]`，格式与连续分组约定沿用 `quant_int4`。AWQ 的激活需完成与量化权重配套的通道缩放，可吸收到前序算子；GPTQ 使用原始激活。
 
 权重恢复为 BF16 后参与 FP32 累加，输出为 `[M,N]` 的 BF16；小 `M` 场景沿用 GEMM 的优化范围。
 
