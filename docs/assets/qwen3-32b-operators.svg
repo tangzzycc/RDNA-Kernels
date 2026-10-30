@@ -1,0 +1,224 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1400" height="1840" viewBox="0 0 1400 1840" role="img" aria-labelledby="title description">
+  <title id="title">Qwen3-32B operator graph</title>
+  <desc id="description">Bottom-to-top inference flow: token embedding, 64 decoder layers, final RMSNorm, LM head and generation sampler. Each decoder layer uses pre-normalized grouped-query attention and a dense SwiGLU MLP with two residual additions. Attention and MLP are expanded in the right panels. Q and K have per-head RMSNorm before RoPE; cached K and V feed attention. Qwen3-32B has hidden size 5120, intermediate size 25600, 64 query heads, 8 KV heads and head dimension 128. Q projection output is 8192; K and V outputs are 1024. The drawing borrows the pastel palette, upward flow, projection trapezoids and dashed panel borders of the supplied Qwen3.5 reference, while retaining Qwen3-32B architecture.</desc>
+  <metadata>
+    Model configuration: https://huggingface.co/Qwen/Qwen3-32B/blob/main/config.json
+    Reference implementation: https://github.com/huggingface/transformers/blob/v4.51.3/src/transformers/models/qwen3/modeling_qwen3.py
+    RMSNorm epsilon: 1e-6. RoPE theta: 1000000. BF16 model weights.
+    Sampling is part of generation runtime outside the model forward pass.
+    Shapes use batch B, current input length S, and total per-sequence KV context length L.
+    Attention tensors use head-major layout [B, heads, sequence, head_dim].
+    Attention score/probability shapes are logical intermediates; fused backends need not materialize them.
+    The sampler selects last-position logits from the sequence logits.
+  </metadata>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M 0 0 L 10 5 L 0 10 L 3 5 z" fill="#111111"/></marker>
+    <style>
+      text { font-family: Arial, 'Liberation Sans', 'DejaVu Sans', sans-serif; font-size: 27px; font-weight: 400; fill: #111111; }
+      .small { font-size: 23px; }
+      .compact { font-size: 18px; }
+      .shape { font-size: 18px; fill: #55535f; }
+      .shape-small { font-size: 17px; fill: #55535f; }
+      .header { font-size: 31px; font-weight: 600; }
+      .info { font-size: 21px; fill: #393741; }
+      .legend { font-size: 19px; fill: #55535f; }
+      .math { font-family: 'Times New Roman', 'Liberation Serif', serif; font-style: italic; font-size: 34px; }
+      .branch { font-family: 'Times New Roman', 'Liberation Serif', serif; font-style: italic; font-size: 28px; }
+      .wire { fill: none; stroke: #111111; stroke-width: 2.2; stroke-linecap: round; stroke-linejoin: round; }
+      .edge { marker-end: url(#arrow); }
+      .expansion { stroke-dasharray: 7 6; }
+      .panel { fill: #f9f9f9; stroke: #888888; stroke-width: 2; stroke-dasharray: 7 7; }
+      .node { stroke: #111111; stroke-width: 2.2; }
+      .linear { fill: #e6e4ef; }
+      .norm { fill: #f7ebcf; }
+      .attention { fill: #f9f9df; }
+      .rope { fill: #f4e6e6; }
+      .cache { fill: #eeeeee; }
+    </style>
+  </defs>
+  <rect width="1400" height="1840" fill="#ffffff"/>
+
+<text x="80" y="43" text-anchor="start" dominant-baseline="middle" class="header">Qwen3-32B</text>
+<text x="80" y="82" text-anchor="start" dominant-baseline="middle" class="info">64 layers · hidden 5120 · FFN 25600 · Q / KV heads 64 / 8 · head dim 128 · BF16</text>
+<text x="80" y="113" text-anchor="start" dominant-baseline="middle" class="legend">B: batch · S: input length (decode: S = 1) · L: total KV context · vocabulary: 151936</text>
+<g id="operator-graph" transform="translate(0 140)">
+<rect x="80" y="395" width="390" height="830" rx="27" class="panel"/>
+<rect x="550" y="165" width="810" height="500" rx="30" class="panel"/>
+<rect x="550" y="805" width="810" height="835" rx="30" class="panel"/>
+<text x="35" y="810" text-anchor="middle" dominant-baseline="middle" class="">64×</text>
+<path d="M 282 1400 L 282 1365" class="wire edge"/>
+<path d="M 282 1300 L 282 1120" class="wire edge"/>
+<path d="M 282 1050 L 282 975" class="wire edge"/>
+<path d="M 282 875 L 282 812" class="wire edge"/>
+<path d="M 282 788 L 282 730" class="wire edge"/>
+<path d="M 282 660 L 282 595" class="wire edge"/>
+<path d="M 282 500 L 282 462" class="wire edge"/>
+<path d="M 282 438 L 282 355" class="wire edge"/>
+<path d="M 282 295 L 282 260" class="wire edge"/>
+<path d="M 282 182 L 282 150" class="wire edge"/>
+<path d="M 282 80 L 282 38" class="wire edge"/>
+<path d="M 282 1175 L 115 1175 Q 105 1175 105 1165 L 105 810 Q 105 800 115 800 L 270 800" class="wire edge"/>
+<path d="M 282 760 L 130 760 Q 120 760 120 750 L 120 460 Q 120 450 130 450 L 270 450" class="wire edge"/>
+<path d="M 420 547 L 550 547" class="wire edge expansion"/>
+<path d="M 420 925 L 550 925" class="wire edge expansion"/>
+<path d="M 965 700 L 965 640" class="wire"/>
+<path d="M 965 640 L 800 640 Q 790 640 790 630 L 790 605" class="wire"/>
+<path d="M 965 640 L 1130 640 Q 1140 640 1140 630 L 1140 605" class="wire"/>
+<path d="M 790 540 L 790 474" class="wire"/>
+<path d="M 790 436 L 790 345 Q 790 335 800 335 L 953 335" class="wire"/>
+<path d="M 1140 540 L 1140 345 Q 1140 335 1130 335 L 977 335" class="wire"/>
+<path d="M 965 323 L 965 275" class="wire edge"/>
+<path d="M 965 210 L 965 138" class="wire edge"/>
+<path d="M 960 1665 L 960 1630" class="wire"/>
+<path d="M 960 1630 L 750 1630 Q 740 1630 740 1620 L 740 1605" class="wire"/>
+<path d="M 960 1630 L 960 1605" class="wire"/>
+<path d="M 960 1630 L 1170 1630 Q 1180 1630 1180 1620 L 1180 1605" class="wire"/>
+<path d="M 740 1530 L 740 1490" class="wire"/>
+<path d="M 960 1530 L 960 1490" class="wire"/>
+<path d="M 1180 1530 L 1180 1490" class="wire"/>
+<path d="M 740 1425 L 740 1380" class="wire"/>
+<path d="M 960 1425 L 960 1380" class="wire"/>
+<path d="M 740 1310 L 740 1275" class="wire"/>
+<path d="M 960 1310 L 960 1275" class="wire"/>
+<path d="M 740 1215 L 740 1075" class="wire edge"/>
+<path d="M 960 1215 L 960 1180" class="wire"/>
+<path d="M 1180 1425 L 1180 1180" class="wire"/>
+<path d="M 960 1110 L 960 1075" class="wire edge"/>
+<path d="M 1180 1110 L 1180 1075" class="wire edge"/>
+<path d="M 960 965 L 960 915" class="wire"/>
+<path d="M 960 835 L 960 775" class="wire edge"/>
+<g id="token-ids"><rect x="145" y="1400" width="275" height="55" rx="9" class="node cache"/>
+<text x="282.5" y="1420.5" text-anchor="middle" dominant-baseline="middle" class="small">Token IDs</text>
+<text x="282.5" y="1444.5" text-anchor="middle" dominant-baseline="middle" class="shape">[B,S]</text>
+</g>
+<g id="embedding"><rect x="145" y="1300" width="275" height="65" rx="9" class="node linear"/>
+<text x="282.5" y="1325.5" text-anchor="middle" dominant-baseline="middle" class="small">Embedding</text>
+<text x="282.5" y="1349.5" text-anchor="middle" dominant-baseline="middle" class="shape">[B,S] → [B,S,5120]</text>
+</g>
+<g id="input-rmsnorm"><rect x="145" y="1050" width="275" height="70" rx="5" class="node norm"/>
+<text x="282.5" y="1078.0" text-anchor="middle" dominant-baseline="middle" class="small">RMSNorm</text>
+<text x="282.5" y="1102.0" text-anchor="middle" dominant-baseline="middle" class="shape">[B,S,5120]</text>
+</g>
+<g id="attention-overview"><rect x="145" y="875" width="275" height="100" rx="13" class="node attention"/>
+<text x="282.5" y="918.0" text-anchor="middle" dominant-baseline="middle" class="small">Attention (GQA)</text>
+<text x="282.5" y="942.0" text-anchor="middle" dominant-baseline="middle" class="shape">[B,S,5120] → [B,S,5120]</text>
+</g>
+<g id="attention-residual-add"><circle cx="282" cy="800" r="12" fill="#f9f9f9" stroke="#111111" stroke-width="2.2"/>
+<path d="M 272 800 L 292 800" class="wire"/>
+<path d="M 282 790 L 282 810" class="wire"/>
+</g>
+<g id="post-attention-rmsnorm"><rect x="145" y="660" width="275" height="70" rx="5" class="node norm"/>
+<text x="282.5" y="688.0" text-anchor="middle" dominant-baseline="middle" class="small">RMSNorm</text>
+<text x="282.5" y="712.0" text-anchor="middle" dominant-baseline="middle" class="shape">[B,S,5120]</text>
+</g>
+<g id="mlp-overview"><rect x="145" y="500" width="275" height="95" rx="13" class="node linear"/>
+<text x="282.5" y="540.5" text-anchor="middle" dominant-baseline="middle" class="small">SwiGLU MLP</text>
+<text x="282.5" y="564.5" text-anchor="middle" dominant-baseline="middle" class="shape">[B,S,5120] → [B,S,5120]</text>
+</g>
+<g id="mlp-residual-add"><circle cx="282" cy="450" r="12" fill="#f9f9f9" stroke="#111111" stroke-width="2.2"/>
+<path d="M 272 450 L 292 450" class="wire"/>
+<path d="M 282 440 L 282 460" class="wire"/>
+</g>
+<g id="final-rmsnorm"><rect x="145" y="295" width="275" height="60" rx="5" class="node norm"/>
+<text x="282.5" y="318.0" text-anchor="middle" dominant-baseline="middle" class="small">RMSNorm</text>
+<text x="282.5" y="342.0" text-anchor="middle" dominant-baseline="middle" class="shape">[B,S,5120]</text>
+</g>
+<g id="lm-head"><path d="M 185 182 H 380 Q 396 182 402 196 L 418 248 Q 422 260 408 260 H 157 Q 143 260 147 248 L 163 196 Q 169 182 185 182 Z" class="node linear"/>
+<text x="282.5" y="214.0" text-anchor="middle" dominant-baseline="middle" class="small">LM Head</text>
+<text x="282.5" y="238.0" text-anchor="middle" dominant-baseline="middle" class="shape-small">5120 → 151936</text>
+</g>
+<g id="sampler"><rect x="145" y="80" width="275" height="70" rx="9" class="node attention"/>
+<text x="282.5" y="108.0" text-anchor="middle" dominant-baseline="middle" class="small">Sampler</text>
+<text x="282.5" y="132.0" text-anchor="middle" dominant-baseline="middle" class="shape">[B,151936] → [B]</text>
+</g>
+<rect x="220.0" y="154" width="124" height="24" rx="3" fill="#f9f9f9"/>
+<text x="282" y="166" text-anchor="middle" dominant-baseline="middle" class="shape">[B,S,151936]</text>
+<text x="432" y="119" text-anchor="start" dominant-baseline="middle" class="shape-small">Last-position</text>
+<text x="432" y="139" text-anchor="start" dominant-baseline="middle" class="shape-small">logits</text>
+<rect x="229.0" y="1251" width="106" height="24" rx="3" fill="#f9f9f9"/>
+<text x="282" y="1263" text-anchor="middle" dominant-baseline="middle" class="shape">[B,S,5120]</text>
+<g id="gate-projection"><path d="M 692 540 H 888 Q 902 540 898 552 L 882 591 Q 876 605 860 605 H 720 Q 704 605 698 591 L 682 552 Q 678 540 692 540 Z" class="node linear"/>
+<text x="790.0" y="565.5" text-anchor="middle" dominant-baseline="middle" class="small">Gate Linear</text>
+<text x="790.0" y="589.5" text-anchor="middle" dominant-baseline="middle" class="shape-small">5120 → 25600</text>
+</g>
+<g id="up-projection"><path d="M 1042 540 H 1238 Q 1252 540 1248 552 L 1232 591 Q 1226 605 1210 605 H 1070 Q 1054 605 1048 591 L 1032 552 Q 1028 540 1042 540 Z" class="node linear"/>
+<text x="1140.0" y="565.5" text-anchor="middle" dominant-baseline="middle" class="small">Up Linear</text>
+<text x="1140.0" y="589.5" text-anchor="middle" dominant-baseline="middle" class="shape-small">5120 → 25600</text>
+</g>
+<g id="silu"><circle cx="790" cy="455" r="19" fill="#faf5d8" stroke="#cabc78" stroke-width="1.8"/>
+<text x="790" y="455" text-anchor="middle" dominant-baseline="middle" class="math">σ</text>
+<text x="825" y="455" text-anchor="start" dominant-baseline="middle" class="">SiLU</text>
+</g>
+<g id="swiglu-multiply"><circle cx="965" cy="335" r="12" fill="#f9f9f9" stroke="#111111" stroke-width="2.2"/>
+<path d="M 957 327 L 973 343" class="wire"/>
+<path d="M 957 343 L 973 327" class="wire"/>
+</g>
+<g id="down-projection"><path d="M 895 210 H 1035 Q 1051 210 1057 224 L 1073 263 Q 1077 275 1063 275 H 867 Q 853 275 857 263 L 873 224 Q 879 210 895 210 Z" class="node linear"/>
+<text x="965.0" y="235.5" text-anchor="middle" dominant-baseline="middle" class="small">Down Linear</text>
+<text x="965.0" y="259.5" text-anchor="middle" dominant-baseline="middle" class="shape-small">25600 → 5120</text>
+</g>
+<text x="984" y="300" text-anchor="start" dominant-baseline="middle" class="shape">[B,S,25600]</text>
+<text x="770" y="387" text-anchor="end" dominant-baseline="middle" class="shape">[B,S,25600]</text>
+<text x="1160" y="430" text-anchor="start" dominant-baseline="middle" class="shape">[B,S,25600]</text>
+<text x="986" y="149" text-anchor="start" dominant-baseline="middle" class="shape">[B,S,5120]</text>
+<text x="986" y="691" text-anchor="start" dominant-baseline="middle" class="shape">[B,S,5120]</text>
+<g id="q-projection"><path d="M 657 1530 H 823 Q 837 1530 833 1542 L 817 1591 Q 811 1605 795 1605 H 685 Q 669 1605 663 1591 L 647 1542 Q 643 1530 657 1530 Z" class="node linear"/>
+<text x="740.0" y="1560.5" text-anchor="middle" dominant-baseline="middle" class="small">Q Linear</text>
+<text x="740.0" y="1584.5" text-anchor="middle" dominant-baseline="middle" class="shape-small">5120 → 8192</text>
+</g>
+<g id="k-projection"><path d="M 877 1530 H 1043 Q 1057 1530 1053 1542 L 1037 1591 Q 1031 1605 1015 1605 H 905 Q 889 1605 883 1591 L 867 1542 Q 863 1530 877 1530 Z" class="node linear"/>
+<text x="960.0" y="1560.5" text-anchor="middle" dominant-baseline="middle" class="small">K Linear</text>
+<text x="960.0" y="1584.5" text-anchor="middle" dominant-baseline="middle" class="shape-small">5120 → 1024</text>
+</g>
+<g id="v-projection"><path d="M 1097 1530 H 1263 Q 1277 1530 1273 1542 L 1257 1591 Q 1251 1605 1235 1605 H 1125 Q 1109 1605 1103 1591 L 1087 1542 Q 1083 1530 1097 1530 Z" class="node linear"/>
+<text x="1180.0" y="1560.5" text-anchor="middle" dominant-baseline="middle" class="small">V Linear</text>
+<text x="1180.0" y="1584.5" text-anchor="middle" dominant-baseline="middle" class="shape-small">5120 → 1024</text>
+</g>
+<g id="q-reshape"><rect x="640" y="1425" width="200" height="65" rx="5" class="node cache"/>
+<text x="740.0" y="1450.5" text-anchor="middle" dominant-baseline="middle" class="compact">Reshape + transpose</text>
+<text x="740.0" y="1474.5" text-anchor="middle" dominant-baseline="middle" class="shape">[B,64,S,128]</text>
+</g>
+<g id="k-reshape"><rect x="860" y="1425" width="200" height="65" rx="5" class="node cache"/>
+<text x="960.0" y="1450.5" text-anchor="middle" dominant-baseline="middle" class="compact">Reshape + transpose</text>
+<text x="960.0" y="1474.5" text-anchor="middle" dominant-baseline="middle" class="shape">[B,8,S,128]</text>
+</g>
+<g id="v-reshape"><rect x="1080" y="1425" width="200" height="65" rx="5" class="node cache"/>
+<text x="1180.0" y="1450.5" text-anchor="middle" dominant-baseline="middle" class="compact">Reshape + transpose</text>
+<text x="1180.0" y="1474.5" text-anchor="middle" dominant-baseline="middle" class="shape">[B,8,S,128]</text>
+</g>
+<g id="q-rmsnorm"><rect x="640" y="1310" width="200" height="70" rx="4" class="node norm"/>
+<text x="740.0" y="1338.0" text-anchor="middle" dominant-baseline="middle" class="small">RMSNorm</text>
+<text x="740.0" y="1362.0" text-anchor="middle" dominant-baseline="middle" class="shape">head dim 128</text>
+</g>
+<g id="k-rmsnorm"><rect x="860" y="1310" width="200" height="70" rx="4" class="node norm"/>
+<text x="960.0" y="1338.0" text-anchor="middle" dominant-baseline="middle" class="small">RMSNorm</text>
+<text x="960.0" y="1362.0" text-anchor="middle" dominant-baseline="middle" class="shape">head dim 128</text>
+</g>
+<g id="q-rope"><rect x="640" y="1215" width="200" height="60" rx="4" class="node rope"/>
+<text x="740.0" y="1249.0" text-anchor="middle" dominant-baseline="middle" class="small">RoPE</text>
+</g>
+<g id="k-rope"><rect x="860" y="1215" width="200" height="60" rx="4" class="node rope"/>
+<text x="960.0" y="1249.0" text-anchor="middle" dominant-baseline="middle" class="small">RoPE</text>
+</g>
+<g id="kv-cache"><rect x="865" y="1110" width="415" height="70" rx="7" class="node cache"/>
+<text x="1072.5" y="1138.0" text-anchor="middle" dominant-baseline="middle" class="small">KV Cache · append / read</text>
+<text x="1072.5" y="1162.0" text-anchor="middle" dominant-baseline="middle" class="shape">K,V: [B,8,L,128]</text>
+</g>
+<g id="gqa"><rect x="650" y="965" width="610" height="110" rx="13" class="node attention"/>
+<text x="955.0" y="1002.0" text-anchor="middle" dominant-baseline="middle" class="small">Scaled Dot-Product Attention</text>
+<text x="955.0" y="1026.0" text-anchor="middle" dominant-baseline="middle" class="shape">scores / probs: [B,64,S,L]</text>
+<text x="955.0" y="1050.0" text-anchor="middle" dominant-baseline="middle" class="shape">output: [B,64,S,128]</text>
+</g>
+<text x="718" y="1097" text-anchor="middle" dominant-baseline="middle" class="branch">q</text>
+<text x="938" y="1097" text-anchor="middle" dominant-baseline="middle" class="branch">k</text>
+<text x="1158" y="1097" text-anchor="middle" dominant-baseline="middle" class="branch">v</text>
+<g id="o-projection"><path d="M 850 835 H 1070 Q 1086 835 1092 849 L 1108 903 Q 1112 915 1098 915 H 822 Q 808 915 812 903 L 828 849 Q 834 835 850 835 Z" class="node linear"/>
+<text x="960.0" y="868.0" text-anchor="middle" dominant-baseline="middle" class="small">O Linear</text>
+<text x="960.0" y="892.0" text-anchor="middle" dominant-baseline="middle" class="shape-small">8192 → 5120</text>
+</g>
+<rect x="907.0" y="929" width="106" height="24" rx="3" fill="#f9f9f9"/>
+<text x="960" y="941" text-anchor="middle" dominant-baseline="middle" class="shape">[B,S,8192]</text>
+<text x="1070" y="941" text-anchor="start" dominant-baseline="middle" class="shape-small">merge heads</text>
+<text x="985" y="787" text-anchor="start" dominant-baseline="middle" class="shape">[B,S,5120]</text>
+<text x="985" y="1656" text-anchor="start" dominant-baseline="middle" class="shape">[B,S,5120]</text>
+</g></svg>
