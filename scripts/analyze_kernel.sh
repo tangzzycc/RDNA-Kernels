@@ -59,19 +59,29 @@ has_main() {
     grep -Eq '(^|[^[:alnum:]_])int[[:space:]]+main[[:space:]]*\(' "$1"
 }
 
+list_workloads() {
+    awk '
+        /ProfileWorkload[[:space:]]+workloads[[:space:]]*\[/ { table = 1; next }
+        table && /};/ { table = 0 }
+        table && match($0, /"[a-z][a-z0-9_]*"/) {
+            print substr($0, RSTART + 1, RLENGTH - 2)
+        }
+    ' "$1"
+}
+
 has_workload() {
     local driver="$1" operator="$2"
     [[ -f "$driver" ]] && has_main "$driver" &&
-        grep -Fq -- "#include \"$operator.hip\"" "$driver"
+        list_workloads "$driver" | grep -Fx -- "$operator" >/dev/null
 }
 
 if ((list_only)); then
-    for source in "$repo_root"/kernels/*/*.hip; do
-        operator="$(basename -- "$source" .hip)"
-        driver="$(dirname -- "$source")/profiler.hip"
-        if [[ -f "$source" ]] && has_workload "$driver" "$operator"; then
-            name="${source#"$repo_root/kernels/"}"
-            printf '%s\n' "${name%.hip}"
+    for driver in "$repo_root"/kernels/*/profiler.hip; do
+        if [[ -f "$driver" ]] && has_main "$driver"; then
+            family="$(basename -- "$(dirname -- "$driver")")"
+            while IFS= read -r operator; do
+                printf '%s/%s\n' "$family" "$operator"
+            done < <(list_workloads "$driver")
         fi
     done
     exit 0
@@ -80,8 +90,6 @@ fi
 [[ "$kernel_key" =~ ^[a-z][a-z0-9_]*/[a-z][a-z0-9_]*$ ]] ||
     die "Specify family/operator, e.g. elementwise/add. Use --list to see runnable operators."
 [[ "$gpu_arch" =~ ^gfx[0-9a-f]+$ ]] || die "Expected a GPU target such as gfx1151."
-source="$repo_root/kernels/$kernel_key.hip"
-[[ -f "$source" ]] || die "Source file does not exist: $source"
 family="${kernel_key%/*}"
 operator="${kernel_key#*/}"
 driver="$repo_root/kernels/$family/profiler.hip"

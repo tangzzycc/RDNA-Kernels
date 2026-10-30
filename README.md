@@ -60,7 +60,8 @@ Correctness tests are grouped by operator family in `tests/test_<family>.py`.
 HIP tests compile the operator into a shared library and compare GPU outputs with NumPy references.
 Shared HIP support lives in `common/python/`, with reusable test utilities in `tests/helpers.py`.
 Family-level `profiler.hip` entry points provide smoke checks and benchmarks;
-`--profile` launches the selected workload once. Operator sources contain the kernel and launch function.
+`--profile` launches the selected workload once. Related operators share HIP source files containing kernels and launch functions.
+Tests and analysis commands select operators by `family/operator`, independently of source filenames.
 
 ```bash
 .venv/bin/python -m pytest tests/test_elementwise.py -v

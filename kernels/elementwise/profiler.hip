@@ -1,4 +1,4 @@
-#include "add.hip"
+#include "arithmetic.hip"
 #include "../../common/hip/common.h"
 
 #include <algorithm>
