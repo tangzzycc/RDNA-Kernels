@@ -63,6 +63,8 @@ Family-level `profiler.hip` entry points provide smoke checks and benchmarks;
 `--profile` launches the selected workload once. Related operators share HIP source files containing kernels and launch functions.
 Tests and analysis commands select operators by `family/operator`, independently of source filenames.
 
+Implementation notes for normalization kernels are in [kernels.md](docs/kernels.md).
+
 ```bash
 .venv/bin/python -m pytest tests/test_elementwise.py -v
 ./scripts/analyze_kernel.sh elementwise/add
