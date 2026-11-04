@@ -1,5 +1,6 @@
 #pragma once
 
+#include <hip/amd_detail/amd_hip_runtime.h>
 #include <hip/hip_runtime.h>
 
 #include <cstddef>
@@ -55,6 +56,37 @@ __host__ __device__ inline bool is_aligned(const void* ptr, size_t alignment) {
       default:                            \
         return hipErrorInvalidValue;      \
     }                                     \
+  } while (false)
+
+// 将运行时线程数分发为编译期 BLOCK_SIZE, 并执行对应分支中的代码.
+// 支持 32, 64, 128, 256; 其他值使外层函数返回 hipErrorInvalidValue.
+// 用于返回 hipError_t 的 launch 函数, 启动时须保证 block.x == BLOCK_SIZE.
+#define HIP_DISPATCH_BLOCK_SIZE(value, ...) \
+  do {                                      \
+    switch (value) {                        \
+      case 32: {                            \
+        constexpr int BLOCK_SIZE = 32;      \
+        __VA_ARGS__;                        \
+        break;                              \
+      }                                     \
+      case 64: {                            \
+        constexpr int BLOCK_SIZE = 64;      \
+        __VA_ARGS__;                        \
+        break;                              \
+      }                                     \
+      case 128: {                           \
+        constexpr int BLOCK_SIZE = 128;     \
+        __VA_ARGS__;                        \
+        break;                              \
+      }                                     \
+      case 256: {                           \
+        constexpr int BLOCK_SIZE = 256;     \
+        __VA_ARGS__;                        \
+        break;                              \
+      }                                     \
+      default:                              \
+        return hipErrorInvalidValue;        \
+    }                                       \
   } while (false)
 
 // 预热后使用 HIP event 计时, 返回一次 launch 调用的平均设备耗时, 单位为 us.
@@ -125,6 +157,76 @@ struct alignas(sizeof(T) * VEC_SIZE) vec_n_t {
                 "VEC_SIZE must be a positive power of two");
   T val[VEC_SIZE];
 };
+
+// 一元逐元素遍历: 负责向量读写, 类型转换和标量尾部处理.
+// x, y: [n], 连续存储且使用独立缓冲区; T 为存储类型, 如 hip_bfloat16.
+// op 接收一个 FP32 元素并返回 FP32 结果; VEC_SIZE 表示每个向量的元素数.
+// launch 须保证两个指针满足 sizeof(T) * VEC_SIZE 字节对齐, n 无需整除.
+// 每个线程处理一个完整向量, 编号 n / VEC_SIZE 的线程单独处理标量尾部.
+template <int VEC_SIZE, typename T, typename Op>
+__device__ __forceinline__ void unary_elementwise(const T* __restrict__ x,
+                                                  T* __restrict__ y, size_t n,
+                                                  Op op) {
+  // step 1: 计算全局线程索引和完整向量数, 定义 vec_n_t 向量类型.
+  const size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const size_t num_vec = n / VEC_SIZE;
+  using Vec = vec_n_t<T, VEC_SIZE>;
+
+  // step 2: 读取完整向量, 将元素转为 FP32 后调用 op, 转回 T 并向量写回.
+  if (i < num_vec) {
+    const Vec vx = reinterpret_cast<const Vec*>(x)[i];
+    Vec result;
+#pragma unroll
+    for (int j = 0; j < VEC_SIZE; ++j) {
+      result.val[j] = static_cast<T>(op(static_cast<float>(vx.val[j])));
+    }
+    reinterpret_cast<Vec*>(y)[i] = result;
+  } else if (i == num_vec) {
+    // step 3: 由尾部任务线程处理不足一个向量的元素, 跳过越界线程.
+    const size_t tail = n % VEC_SIZE;
+    const size_t offset = n - tail;
+    for (size_t j = 0; j < tail; ++j) {
+      y[offset + j] = static_cast<T>(op(static_cast<float>(x[offset + j])));
+    }
+  }
+}
+
+// 二元逐元素遍历: 共用向量读写与边界处理, 由 op 定义计算规则.
+// a, b, y: [n], 连续存储且使用独立缓冲区; T 为存储类型.
+// op 接收两个 FP32 元素并返回 FP32 结果; VEC_SIZE 表示每个向量的元素数.
+// launch 须保证三个指针满足 sizeof(T) * VEC_SIZE 字节对齐, n 无需整除.
+// 每个线程处理一个完整向量, 编号 n / VEC_SIZE 的线程单独处理标量尾部.
+template <int VEC_SIZE, typename T, typename Op>
+__device__ __forceinline__ void binary_elementwise(const T* __restrict__ a,
+                                                   const T* __restrict__ b,
+                                                   T* __restrict__ y, size_t n,
+                                                   Op op) {
+  // step 1: 计算全局线程索引和完整向量数, 定义 vec_n_t 向量类型.
+  const size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const size_t num_vec = n / VEC_SIZE;
+  using Vec = vec_n_t<T, VEC_SIZE>;
+
+  // step 2: 读取两个完整向量, 转为 FP32 后调用 op, 转回 T 并向量写回.
+  if (i < num_vec) {
+    const Vec va = reinterpret_cast<const Vec*>(a)[i];
+    const Vec vb = reinterpret_cast<const Vec*>(b)[i];
+    Vec result;
+#pragma unroll
+    for (int j = 0; j < VEC_SIZE; ++j) {
+      result.val[j] = static_cast<T>(
+          op(static_cast<float>(va.val[j]), static_cast<float>(vb.val[j])));
+    }
+    reinterpret_cast<Vec*>(y)[i] = result;
+  } else if (i == num_vec) {
+    // step 3: 由尾部任务线程处理不足一个向量的元素, 跳过越界线程.
+    const size_t tail = n % VEC_SIZE;
+    const size_t offset = n - tail;
+    for (size_t j = 0; j < tail; ++j) {
+      y[offset + j] = static_cast<T>(op(static_cast<float>(a[offset + j]),
+                                        static_cast<float>(b[offset + j])));
+    }
+  }
+}
 
 // 将 input 的 len 个元素划分为标量前缀, 对齐的向量主体和标量尾部.
 // tid 为参与线程编号, stride 为参与线程数; 各线程跨步处理各自的元素.
