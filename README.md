@@ -60,10 +60,13 @@ Correctness tests are grouped by operator family in `tests/test_<family>.py`.
 HIP tests compile the operator into a shared library and compare GPU outputs with NumPy references.
 Shared HIP support lives in `common/python/`, with reusable test utilities in `tests/helpers.py`.
 Family-level `profiler.hip` entry points provide smoke checks and benchmarks;
-`--profile` launches the selected workload once. Related operators share HIP source files containing kernels and launch functions.
+`--profile` launches the selected workload once. Kernel implementations live in operator HIP files,
+and each family's `launch.hip` provides the shared C ABI entry points and launch configuration.
 Tests and analysis commands select operators by `family/operator`, independently of source filenames.
 
-Implementation notes for normalization kernels are in [kernels.md](docs/kernels.md).
+Commands and measured results are in the family READMEs:
+[norm](kernels/norm/README.md), [elementwise](kernels/elementwise/README.md),
+and [matmul](kernels/matmul/README.md).
 
 ```bash
 .venv/bin/python -m pytest tests/test_elementwise.py -v

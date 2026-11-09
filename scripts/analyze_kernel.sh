@@ -6,6 +6,8 @@ kernel_key=""
 gpu_arch="${GPU_ARCH:-gfx1151}"
 list_only=0
 run_only=0
+bandwidth_only=0
+samples=5
 refresh_roof=0
 kernel_args=()
 
@@ -22,6 +24,8 @@ Arguments after -- are forwarded to both modes.
 Options:
   --list          List operators included in family profilers
   --run-only      Compile and execute without profiling
+  --bandwidth     Collect GCEA counters and print total DRAM interface throughput
+  --samples N     Bandwidth captures (default: 5, report the median sample)
   --arch ARCH     GPU target (default: gfx1151, or GPU_ARCH)
   --refresh-roof  Recompute cached hardware Roofline peaks
   -h, --help      Show this help
@@ -30,6 +34,7 @@ Examples:
   scripts/analyze_kernel.sh elementwise/add
   scripts/analyze_kernel.sh elementwise/add -- 1048576
   scripts/analyze_kernel.sh --run-only elementwise/add
+  scripts/analyze_kernel.sh --bandwidth matmul/sgemm_v10
 EOF
 }
 
@@ -42,6 +47,10 @@ while (($#)); do
     case "$1" in
         --list) list_only=1; shift ;;
         --run-only) run_only=1; shift ;;
+        --bandwidth) bandwidth_only=1; shift ;;
+        --samples)
+            (($# >= 2)) || die "--samples requires a positive integer."
+            samples="$2"; shift 2 ;;
         --refresh-roof) refresh_roof=1; shift ;;
         --arch)
             (($# >= 2)) || die "--arch requires a GPU target."
@@ -55,16 +64,23 @@ while (($#)); do
     esac
 done
 
+[[ "$samples" =~ ^[1-9][0-9]*$ ]] || die "--samples requires a positive integer."
+((run_only && bandwidth_only)) && die "Choose either --run-only or --bandwidth."
+
 has_main() {
     grep -Eq '(^|[^[:alnum:]_])int[[:space:]]+main[[:space:]]*\(' "$1"
 }
 
 list_workloads() {
     awk '
-        /ProfileWorkload[[:space:]]+workloads[[:space:]]*\[/ { table = 1; next }
-        table && /};/ { table = 0 }
-        table && match($0, /"[a-z][a-z0-9_]*"/) {
-            print substr($0, RSTART + 1, RLENGTH - 2)
+        /ProfileWorkload[[:space:]]+workloads[[:space:]]*\[/ { table = 1 }
+        table {
+            line = $0
+            while (match(line, /"[a-z][a-z0-9_]*"/)) {
+                print substr(line, RSTART + 1, RLENGTH - 2)
+                line = substr(line, RSTART + RLENGTH)
+            }
+            if ($0 ~ /};/) table = 0
         }
     ' "$1"
 }
@@ -104,9 +120,11 @@ source "$repo_root/.venv/bin/activate"
 run_logged() {
     local log="$1" display="$2"
     shift 2
-    printf '\n$'
-    printf ' %q' "$@"
-    printf '\n'
+    if [[ "$display" != quiet ]]; then
+        printf '\n$'
+        printf ' %q' "$@"
+        printf '\n'
+    fi
     if [[ "$display" == all ]]; then
         "$@" 2>&1 | tee "$log"
     elif "$@" 2>&1 | tee "$log" | awk '/\[Run |\[roofline\]|ERROR/ { print; fflush() }'; then
@@ -138,6 +156,72 @@ run_logged "$results/compile.log" all \
 run_logged "$results/benchmark.log" all "$executable" "$operator" "${kernel_args[@]}"
 if ((run_only)); then
     printf '\nResults: tests/results/%s\n' "$kernel_key"
+    exit 0
+fi
+
+if ((bandwidth_only)); then
+    # 每次创建独立目录, 保留之前的采样记录.
+    mkdir -p -- "$results/gcea"
+    gcea_results="$(mktemp -d "$results/gcea/$(TZ=Asia/Shanghai date +%Y%m%d-%H%M%S)-XXXXXX")"
+    for ((sample = 1; sample <= samples; sample++)); do
+        printf '\nGCEA capture %d/%d\n' "$sample" "$samples"
+        run_logged "$gcea_results/$sample.log" quiet \
+            rocprofv3 --pmc GCEA_RDRAM_SIZE_REQ_sum GCEA_WDRAM_SIZE_REQ_sum \
+            --kernel-include-regex "(^| )${operator}_kernel[<(]" --output-format csv \
+            -d "$gcea_results/$sample" \
+            -- "$executable" "$operator" --profile "${kernel_args[@]}"
+    done
+
+    # 按官方 32-byte 单位换算; 时间戳为 ns, bytes/ns 即十进制 GB/s.
+    # 选取合计吞吐中位数对应的记录, 读写计数使用同一 dispatch 的时间.
+    python - "$gcea_results" "$kernel_key" "${kernel_args[@]}" <<'PY'
+import csv
+import json
+from pathlib import Path
+import sys
+
+directory = Path(sys.argv[1])
+counter_names = ("GCEA_RDRAM_SIZE_REQ_sum", "GCEA_WDRAM_SIZE_REQ_sum")
+records = []
+for capture in sorted(p for p in directory.iterdir() if p.is_dir()):
+    counters = {}
+    for path in capture.rglob("*counter_collection.csv"):
+        with path.open() as stream:
+            for row in csv.DictReader(stream):
+                name = row["Counter_Name"]
+                if name not in counter_names:
+                    continue
+                if name in counters:
+                    raise SystemExit(f"Multiple target dispatches in {capture}")
+                counters[name] = row
+    if set(counters) != set(counter_names):
+        raise SystemExit(f"Missing GCEA read/write counters in {capture}")
+    read, write = (counters[name] for name in counter_names)
+    for key in ("Dispatch_Id", "Agent_Id", "Kernel_Name", "Start_Timestamp", "End_Timestamp"):
+        if read[key] != write[key]:
+            raise SystemExit(f"Read/write counters belong to different dispatches: {capture}")
+    duration_ns = int(read["End_Timestamp"]) - int(read["Start_Timestamp"])
+    if duration_ns <= 0:
+        raise SystemExit(f"Invalid dispatch duration in {capture}")
+    read_bytes = float(read["Counter_Value"]) * 32
+    write_bytes = float(write["Counter_Value"]) * 32
+    records.append({
+        "sample": int(capture.name), "duration_ns": duration_ns,
+        "read_bytes": read_bytes, "write_bytes": write_bytes,
+        "total_GB_s": (read_bytes + write_bytes) / duration_ns,
+    })
+if not records:
+    raise SystemExit("No GCEA counter records were generated")
+median = sorted(records, key=lambda item: item["total_GB_s"])[len(records) // 2]
+summary = {"operator": sys.argv[2], "args": sys.argv[3:],
+           "representative": median, "samples": records}
+(directory / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
+line = (f"{sys.argv[2]}: GCEA DRAM interface={median['total_GB_s']:.2f} GB/s, "
+        f"profile={median['duration_ns'] / 1e6:.3f} ms, samples={len(records)}")
+(directory / "summary.txt").write_text(line + "\n")
+print(line)
+PY
+    printf '\nResults: %s\n' "${gcea_results#"$repo_root/"}"
     exit 0
 fi
 

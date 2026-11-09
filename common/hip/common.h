@@ -12,19 +12,30 @@
 // 判断 ptr 的地址是否满足 alignment 字节对齐, 可在主机和设备端调用.
 // alignment 为 0 时返回 false.
 __host__ __device__ inline bool is_aligned(const void* ptr, size_t alignment) {
-  return alignment != 0 &&
-         reinterpret_cast<std::uintptr_t>(ptr) % alignment == 0;
+  return alignment != 0 && reinterpret_cast<std::uintptr_t>(ptr) % alignment == 0;
 }
 
+// 将可写的连续四个 float 作为 float4 引用访问.
+__device__ __forceinline__ float4& fetch_float4(float& value) {
+  return *reinterpret_cast<float4*>(&value);
+}
+
+// 将只读的连续四个 float 作为 const float4 引用访问.
+__device__ __forceinline__ const float4& fetch_float4(const float& value) {
+  return *reinterpret_cast<const float4*>(&value);
+}
+
+#define FETCH_FLOAT4(element) fetch_float4(element)
+
 // 在主机端检查 HIP 调用的返回值, 出错时打印调用位置和错误信息并退出进程.
-#define HIP_CHECK(call)                                                  \
-  do {                                                                   \
-    const hipError_t hip_check_status = (call);                          \
-    if (hip_check_status != hipSuccess) {                                \
-      std::fprintf(stderr, "%s:%d: %s failed: %s\n", __FILE__, __LINE__, \
-                   #call, hipGetErrorString(hip_check_status));          \
-      std::exit(EXIT_FAILURE);                                           \
-    }                                                                    \
+#define HIP_CHECK(call)                                                         \
+  do {                                                                          \
+    const hipError_t hip_check_status = (call);                                 \
+    if (hip_check_status != hipSuccess) {                                       \
+      std::fprintf(stderr, "%s:%d: %s failed: %s\n", __FILE__, __LINE__, #call, \
+                   hipGetErrorString(hip_check_status));                        \
+      std::exit(EXIT_FAILURE);                                                  \
+    }                                                                           \
   } while (false)
 
 // 将运行时向量宽度分发为编译期 VEC_SIZE, 并执行对应分支中的代码.
@@ -139,8 +150,7 @@ int run_profiler(int argc, char** argv, const ProfileWorkload (&workloads)[N]) {
       }
     }
   }
-  std::fprintf(stderr, "Usage: %s operator [--profile] [operator_args...]\n",
-               argv[0]);
+  std::fprintf(stderr, "Usage: %s operator [--profile] [operator_args...]\n", argv[0]);
   std::fprintf(stderr, "Available operators:");
   for (const auto& workload : workloads) {
     std::fprintf(stderr, " %s", workload.name);
@@ -164,9 +174,8 @@ struct alignas(sizeof(T) * VEC_SIZE) vec_n_t {
 // launch 须保证两个指针满足 sizeof(T) * VEC_SIZE 字节对齐, n 无需整除.
 // 每个线程处理一个完整向量, 编号 n / VEC_SIZE 的线程单独处理标量尾部.
 template <int VEC_SIZE, typename T, typename Op>
-__device__ __forceinline__ void unary_elementwise(const T* __restrict__ x,
-                                                  T* __restrict__ y, size_t n,
-                                                  Op op) {
+__device__ __forceinline__ void unary_elementwise(const T* __restrict__ x, T* __restrict__ y,
+                                                  size_t n, Op op) {
   // step 1: 计算全局线程索引和完整向量数, 定义 vec_n_t 向量类型.
   const size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   const size_t num_vec = n / VEC_SIZE;
@@ -197,10 +206,8 @@ __device__ __forceinline__ void unary_elementwise(const T* __restrict__ x,
 // launch 须保证三个指针满足 sizeof(T) * VEC_SIZE 字节对齐, n 无需整除.
 // 每个线程处理一个完整向量, 编号 n / VEC_SIZE 的线程单独处理标量尾部.
 template <int VEC_SIZE, typename T, typename Op>
-__device__ __forceinline__ void binary_elementwise(const T* __restrict__ a,
-                                                   const T* __restrict__ b,
-                                                   T* __restrict__ y, size_t n,
-                                                   Op op) {
+__device__ __forceinline__ void binary_elementwise(const T* __restrict__ a, const T* __restrict__ b,
+                                                   T* __restrict__ y, size_t n, Op op) {
   // step 1: 计算全局线程索引和完整向量数, 定义 vec_n_t 向量类型.
   const size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   const size_t num_vec = n / VEC_SIZE;
@@ -213,8 +220,8 @@ __device__ __forceinline__ void binary_elementwise(const T* __restrict__ a,
     Vec result;
 #pragma unroll
     for (int j = 0; j < VEC_SIZE; ++j) {
-      result.val[j] = static_cast<T>(
-          op(static_cast<float>(va.val[j]), static_cast<float>(vb.val[j])));
+      result.val[j] =
+          static_cast<T>(op(static_cast<float>(va.val[j]), static_cast<float>(vb.val[j])));
     }
     reinterpret_cast<Vec*>(y)[i] = result;
   } else if (i == num_vec) {
@@ -222,8 +229,8 @@ __device__ __forceinline__ void binary_elementwise(const T* __restrict__ a,
     const size_t tail = n % VEC_SIZE;
     const size_t offset = n - tail;
     for (size_t j = 0; j < tail; ++j) {
-      y[offset + j] = static_cast<T>(op(static_cast<float>(a[offset + j]),
-                                        static_cast<float>(b[offset + j])));
+      y[offset + j] =
+          static_cast<T>(op(static_cast<float>(a[offset + j]), static_cast<float>(b[offset + j])));
     }
   }
 }
@@ -233,10 +240,8 @@ __device__ __forceinline__ void binary_elementwise(const T* __restrict__ a,
 // vec_op 接收 vec_n_t<T, VEC_SIZE>, scalar_op 接收单个 T 元素.
 // 各线程须使用相同的 input, len 和 stride, 且满足 0 <= tid < stride.
 template <int VEC_SIZE, typename T, typename VecOp, typename ScalarOp>
-__device__ inline void vectorize_read_with_alignment(const T* input, int len,
-                                                     int tid, int stride,
-                                                     VecOp&& vec_op,
-                                                     ScalarOp&& scalar_op) {
+__device__ inline void vectorize_read_with_alignment(const T* input, int len, int tid, int stride,
+                                                     VecOp&& vec_op, ScalarOp&& scalar_op) {
   using Vec = vec_n_t<T, VEC_SIZE>;
   constexpr int WIDTH = sizeof(T) * VEC_SIZE;
 
