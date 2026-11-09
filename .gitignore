@@ -66,6 +66,8 @@ vcpkg_installed/
 # test output & cache
 Testing/
 .cache/
+.pytest_cache/
+__pycache__/
 
 # Project virtual environment
 .venv/

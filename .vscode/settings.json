@@ -1,0 +1,13 @@
+{
+  "files.associations": {
+    "*.hip": "cpp",
+    "*.h": "cpp"
+  },
+  "clangd.path": "${workspaceFolder}/.venv/bin/clangd",
+  "clangd.arguments": [
+    "--background-index",
+    "--compile-commands-dir=${workspaceFolder}/build/hip",
+    "--query-driver=${workspaceFolder}/.venv/lib/python*/site-packages/_rocm_sdk_devel/lib/llvm/bin/clang++"
+  ],
+  "hip.enableInCppFiles": false
+}
