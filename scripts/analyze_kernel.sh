@@ -4,6 +4,7 @@ set -euo pipefail
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 kernel_key=""
 gpu_arch="${GPU_ARCH:-gfx1151}"
+cu_mode=0
 list_only=0
 run_only=0
 bandwidth_only=0
@@ -15,7 +16,7 @@ usage() {
     cat <<'EOF'
 Usage: scripts/analyze_kernel.sh [options] family/operator [-- operator_args...]
 
-Compile kernels/<family>/profiler.hip, run the selected operator, collect all
+Compile hip/<family>/profiler.hip, run the selected operator, collect all
 counters, and print the complete rocprof-compute report. The family profiler
 runs a smoke check and benchmark; --profile runs one deterministic workload.
 Full correctness tests are in tests/test_<family>.py and run separately via pytest.
@@ -27,6 +28,7 @@ Options:
   --bandwidth     Collect GCEA counters and print total DRAM interface throughput
   --samples N     Bandwidth captures (default: 5, report the median sample)
   --arch ARCH     GPU target (default: gfx1151, or GPU_ARCH)
+  --cu-mode       Compile in CU mode (default: WGP mode)
   --refresh-roof  Recompute cached hardware Roofline peaks
   -h, --help      Show this help
 
@@ -48,6 +50,7 @@ while (($#)); do
         --list) list_only=1; shift ;;
         --run-only) run_only=1; shift ;;
         --bandwidth) bandwidth_only=1; shift ;;
+        --cu-mode) cu_mode=1; shift ;;
         --samples)
             (($# >= 2)) || die "--samples requires a positive integer."
             samples="$2"; shift 2 ;;
@@ -92,7 +95,7 @@ has_workload() {
 }
 
 if ((list_only)); then
-    for driver in "$repo_root"/kernels/*/profiler.hip; do
+    for driver in "$repo_root"/hip/*/profiler.hip; do
         if [[ -f "$driver" ]] && has_main "$driver"; then
             family="$(basename -- "$(dirname -- "$driver")")"
             while IFS= read -r operator; do
@@ -108,9 +111,9 @@ fi
 [[ "$gpu_arch" =~ ^gfx[0-9a-f]+$ ]] || die "Expected a GPU target such as gfx1151."
 family="${kernel_key%/*}"
 operator="${kernel_key#*/}"
-driver="$repo_root/kernels/$family/profiler.hip"
+driver="$repo_root/hip/$family/profiler.hip"
 has_workload "$driver" "$operator" ||
-    die "$kernel_key needs a workload in kernels/$family/profiler.hip before it can be analyzed."
+    die "$kernel_key needs a workload in hip/$family/profiler.hip before it can be analyzed."
 [[ -f "$repo_root/.venv/bin/activate" ]] || die "Project .venv is missing; follow the README installation steps."
 
 cd -- "$repo_root"
@@ -151,8 +154,12 @@ valid_roofline() {
 executable="$repo_root/build/hip/$family/profiler"
 results="$repo_root/tests/results/$kernel_key"
 mkdir -p -- "$(dirname -- "$executable")" "$results"
+compile_flags=(-O3 -std=c++17 "--offload-arch=$gpu_arch")
+if ((cu_mode)); then
+    compile_flags+=(-mcumode)
+fi
 run_logged "$results/compile.log" all \
-    hipcc -O3 -std=c++17 "--offload-arch=$gpu_arch" "$driver" -o "$executable"
+    hipcc "${compile_flags[@]}" "$driver" -o "$executable"
 run_logged "$results/benchmark.log" all "$executable" "$operator" "${kernel_args[@]}"
 if ((run_only)); then
     printf '\nResults: tests/results/%s\n' "$kernel_key"
@@ -160,6 +167,8 @@ if ((run_only)); then
 fi
 
 if ((bandwidth_only)); then
+    # 精度后缀区分 profiler 工作负载, 两种精度可以共用同一个模板 kernel.
+    kernel_operator="${operator%_fp16}"
     # 每次创建独立目录, 保留之前的采样记录.
     mkdir -p -- "$results/gcea"
     gcea_results="$(mktemp -d "$results/gcea/$(TZ=Asia/Shanghai date +%Y%m%d-%H%M%S)-XXXXXX")"
@@ -167,7 +176,7 @@ if ((bandwidth_only)); then
         printf '\nGCEA capture %d/%d\n' "$sample" "$samples"
         run_logged "$gcea_results/$sample.log" quiet \
             rocprofv3 --pmc GCEA_RDRAM_SIZE_REQ_sum GCEA_WDRAM_SIZE_REQ_sum \
-            --kernel-include-regex "(^| )${operator}_kernel[<(]" --output-format csv \
+            --kernel-include-regex "(^| )${kernel_operator}_kernel[<(]" --output-format csv \
             -d "$gcea_results/$sample" \
             -- "$executable" "$operator" --profile "${kernel_args[@]}"
     done

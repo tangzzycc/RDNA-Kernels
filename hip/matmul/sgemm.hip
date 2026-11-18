@@ -4,6 +4,8 @@
 #include <hip/amd_detail/amd_hip_runtime.h>
 #include <hip/amd_detail/amd_hip_vector_types.h>
 #include <hip/hip_runtime.h>
+#include <hip/hip_fp16.h>
+#include <type_traits>
 
 /*
  * SGEMM: 使用 FP32 计算矩阵乘法 C = A * B.
@@ -138,20 +140,20 @@ __global__ void sgemm_v4_kernel(const float* __restrict__ A, const float* __rest
    * 两种映射都存在共享 A tile, 读取 B 相邻列分块的任务, 区别是这些任务的编号排列.
    * 原映射固定 x, 增加 y 时共享 A; 当前映射固定 y, 增加 x 时共享 A.
    *
-   * 例如 FP32, M=N=K=5120, BLOCK_M=BLOCK_N=64, BLOCK_K=8, grid(80, 80).
+   * 例如 FP32, M=N=K=8192, BLOCK_M=BLOCK_N=64, BLOCK_K=8, grid(128, 128).
    * 固定 bkIdx=0, 两个任务加载的 tile 为:
    *   A: 都加载 A[0:64, 0:8].
    *   B: 分别加载 B[0:8, 0:64] 与 B[0:8, 64:128].
    * 两种映射下 B 的每行加载区域都相邻, B_ptr 起点相差 256 bytes.
    *
    * 这两个任务对应的 block 坐标与编号为:
-   *   原映射: blockIdx=(0, 0), (0, 1), 线性编号为 0, 80.
+   *   原映射: blockIdx=(0, 0), (0, 1), 线性编号为 0, 128.
    *   当前映射: blockIdx=(0, 0), (1, 0), 线性编号为 0, 1.
    * block 的线性编号为 blockIdx.y * gridDim.x + blockIdx.x, x 维变化最快.
    *
    * 用 Ar 表示第 r 个 A 行分块, Bc 表示第 c 个 B 列分块, 按线性编号排列:
-   *   原映射: (A0, B0), (A1, B0), ..., (A79, B0), (A0, B1), ...
-   *   当前映射: (A0, B0), (A0, B1), ..., (A0, B79), (A1, B0), ...
+   *   原映射: (A0, B0), (A1, B0), ..., (A127, B0), (A0, B1), ...
+   *   当前映射: (A0, B0), (A0, B1), ..., (A0, B127), (A1, B0), ...
    * 总共需要加载的分块相同.
    * 当前映射把共享 A, 读取 B 相邻列分块的任务放在相邻编号上, 增加缓存复用的机会.
    * GPU 不保证严格按编号执行, 收益依赖 shape 与硬件.
@@ -419,8 +421,7 @@ __global__ void sgemm_v6_kernel(const float* __restrict__ A, const float* __rest
 // 启动 grid(N / BLOCK_N, M / BLOCK_M), block(256), K9_NUM_THREADS=256.
 // 16 * 16 表示逻辑线程网格, gfx1151 上一个 block 包含 8 个 wave32.
 // scripts/sgemm_v9_autotune.sh 扫描五个 tile 参数, 检查整除条件与设备 LDS 上限.
-// FP32, M=N=K=5120 时, <128, 256, 8, 4, 4, 256> 复测约 26.23 ms.
-// <256, 128, 8, 4, 4, 256> 基本持平, 两组均比本次 V6 对照快约 1.26 倍.
+// 默认配置 <128, 256, 8, 4, 4, 256>, 基准 shape 为 M=N=K=8192.
 // 以上参数顺序为 <BLOCK_M, BLOCK_N, BLOCK_K, THREAD_M, THREAD_N, K9_NUM_THREADS>.
 // M, N, K 须覆盖完整 tile, 向量地址须对齐, 其他 shape 的参数需重新测量.
 template <int BLOCK_M, int BLOCK_N, int BLOCK_K, int THREAD_M, int THREAD_N, int K9_NUM_THREADS>
@@ -538,7 +539,7 @@ __global__ void __launch_bounds__(K9_NUM_THREADS)
 // V10: wave 分块, block tile 先划分为 wave tile, 再分配各线程的寄存器输出小块.
 // 参考 10_kernel_warptiling.cuh, 按 gfx1151 的 wave32 分配线程, 沿用 V6 的向量加载与 A 转置.
 // 启动 grid(N / BLOCK_N, M / BLOCK_M), block(BLOCK_SIZE).
-// gfx1151, FP32, M=N=K=5120 采用 <128, 128, 16, 32, 128, 2, 4, 4, 128>, 复测约 21.81 ms.
+// gfx1151 默认配置 <128, 128, 16, 32, 128, 2, 4, 4, 128>, 基准 shape 为 M=N=K=8192.
 // WAVE_N_ITERS 指定 wave tile 沿 col 划分的子块数, WAVE_M_ITERS 由覆盖面积推导.
 // BLOCK_SIZE = (BLOCK_M / WAVE_M) * (BLOCK_N / WAVE_N) * 32.
 // 分块, 子块与加载 stride 须整除并完整覆盖, M, N, K 覆盖完整 tile, 向量地址须对齐.
@@ -668,6 +669,309 @@ __global__ void __launch_bounds__(BLOCK_SIZE)
           tmp.z = thread_res[index + 2];
           tmp.w = thread_res[index + 3];
           FETCH_FLOAT4(C_tile[(thread_row * THREAD_M + m) * N + thread_col * THREAD_N + n]) = tmp;
+        }
+      }
+    }
+  }
+}
+
+namespace sgemm_opt {
+
+// 用原始字节保存四个 T, 避免 FP16 预取时提前拆分高低半字.
+template <typename T>
+using PackedVec = vec_n_t<uint32_t, 4 * sizeof(T) / sizeof(uint32_t)>;
+
+// 将下一轮全局向量读入寄存器, 预取数据与当前 LDS tile 分离.
+template <typename T, int BLOCK_M, int BLOCK_N, int BLOCK_K, int BLOCK_SIZE>
+__device__ __forceinline__ void prefetch_tile(const T* __restrict__ A, const T* __restrict__ B,
+                                              int N, int K, PackedVec<T>* __restrict__ prefetch_A,
+                                              PackedVec<T>* __restrict__ prefetch_B) {
+  using Vec = PackedVec<T>;
+  const int load_rowA = threadIdx.x / (BLOCK_K / 4);
+  const int load_vec_colA = threadIdx.x % (BLOCK_K / 4);
+  const int load_rowB = threadIdx.x / (BLOCK_N / 4);
+  const int load_vec_colB = threadIdx.x % (BLOCK_N / 4);
+  constexpr int stride_A = BLOCK_SIZE * 4 / BLOCK_K;
+  constexpr int stride_B = BLOCK_SIZE * 4 / BLOCK_N;
+
+#pragma unroll
+  for (int i = 0; i < BLOCK_M / stride_A; i++) {
+    prefetch_A[i] =
+        *reinterpret_cast<const Vec*>(A + (load_rowA + i * stride_A) * K + load_vec_colA * 4);
+  }
+#pragma unroll
+  for (int i = 0; i < BLOCK_K / stride_B; i++) {
+    prefetch_B[i] =
+        *reinterpret_cast<const Vec*>(B + (load_rowB + i * stride_B) * N + load_vec_colB * 4);
+  }
+}
+
+// A 转置为 As[BLOCK_K, BLOCK_M], B 保持 Bs[BLOCK_K, BLOCK_N], LDS 均使用 FP32.
+template <typename T, int BLOCK_M, int BLOCK_N, int BLOCK_K, int BLOCK_SIZE>
+__device__ __forceinline__ void store_tile(const PackedVec<T>* __restrict__ prefetch_A,
+                                           const PackedVec<T>* __restrict__ prefetch_B,
+                                           float* __restrict__ A_shared,
+                                           float* __restrict__ B_shared, int load_tid) {
+  using Vec = vec_n_t<T, 4>;
+  const int load_rowA = load_tid / (BLOCK_K / 4);
+  const int load_vec_colA = load_tid % (BLOCK_K / 4);
+  const int load_rowB = load_tid / (BLOCK_N / 4);
+  const int load_vec_colB = load_tid % (BLOCK_N / 4);
+  constexpr int stride_A = BLOCK_SIZE * 4 / BLOCK_K;
+  constexpr int stride_B = BLOCK_SIZE * 4 / BLOCK_N;
+
+#pragma unroll
+  for (int i = 0; i < BLOCK_M / stride_A; i++) {
+    Vec values;
+    __builtin_memcpy(&values, prefetch_A + i, sizeof(Vec));
+#pragma unroll
+    for (int j = 0; j < 4; j++) {
+      // A[load_rowA + i * stride_A, load_vec_colA * 4 + j]
+      // -> As[load_vec_colA * 4 + j, load_rowA + i * stride_A].
+      A_shared[(load_vec_colA * 4 + j) * BLOCK_M + load_rowA + i * stride_A] =
+          static_cast<float>(values.val[j]);
+    }
+  }
+#pragma unroll
+  for (int i = 0; i < BLOCK_K / stride_B; i++) {
+    Vec values;
+    __builtin_memcpy(&values, prefetch_B + i, sizeof(Vec));
+    FETCH_FLOAT4(B_shared[(load_rowB + i * stride_B) * BLOCK_N + load_vec_colB * 4]) =
+        make_float4(static_cast<float>(values.val[0]), static_cast<float>(values.val[1]),
+                    static_cast<float>(values.val[2]), static_cast<float>(values.val[3]));
+  }
+}
+
+// V11 的加载组仅使用半个 block, 完整填充一套 LDS tile.
+template <typename T, int BLOCK_M, int BLOCK_N, int BLOCK_K, int LOAD_THREADS>
+__device__ __forceinline__ void load_tile(const T* __restrict__ A, const T* __restrict__ B,
+                                          float* __restrict__ A_shared,
+                                          float* __restrict__ B_shared, int N, int K,
+                                          int load_tid) {
+  using Vec = vec_n_t<T, 4>;
+  const int load_rowA = load_tid / (BLOCK_K / 4);
+  const int load_vec_colA = load_tid % (BLOCK_K / 4);
+  const int load_rowB = load_tid / (BLOCK_N / 4);
+  const int load_vec_colB = load_tid % (BLOCK_N / 4);
+  constexpr int stride_A = LOAD_THREADS * 4 / BLOCK_K;
+  constexpr int stride_B = LOAD_THREADS * 4 / BLOCK_N;
+
+  for (int offset = 0; offset + stride_A <= BLOCK_M; offset += stride_A) {
+    const Vec values =
+        *reinterpret_cast<const Vec*>(A + (load_rowA + offset) * K + load_vec_colA * 4);
+    for (int i = 0; i < 4; i++) {
+      A_shared[(load_vec_colA * 4 + i) * BLOCK_M + load_rowA + offset] =
+          static_cast<float>(values.val[i]);
+    }
+  }
+  for (int offset = 0; offset + stride_B <= BLOCK_K; offset += stride_B) {
+    const Vec values =
+        *reinterpret_cast<const Vec*>(B + (load_rowB + offset) * N + load_vec_colB * 4);
+    FETCH_FLOAT4(B_shared[(load_rowB + offset) * BLOCK_N + load_vec_colB * 4]) =
+        make_float4(static_cast<float>(values.val[0]), static_cast<float>(values.val[1]),
+                    static_cast<float>(values.val[2]), static_cast<float>(values.val[3]));
+  }
+}
+
+// 一个 wave 覆盖 [WAVE_M, WAVE_N], 每线程跨子块计算多个 [THREAD_M, THREAD_N] 输出.
+template <int BLOCK_M, int BLOCK_N, int BLOCK_K, int WAVE_M, int WAVE_N, int WAVE_N_ITERS,
+          int THREAD_M, int THREAD_N>
+__device__ __forceinline__ void process_tile(const float* __restrict__ A_shared,
+                                             const float* __restrict__ B_shared,
+                                             float* __restrict__ thread_res, int wave_row,
+                                             int wave_col, int thread_row, int thread_col) {
+  constexpr int WAVE_M_ITERS = WAVE_M * WAVE_N / (32 * THREAD_M * THREAD_N * WAVE_N_ITERS);
+  constexpr int SUB_M = WAVE_M / WAVE_M_ITERS;
+  constexpr int SUB_N = WAVE_N / WAVE_N_ITERS;
+  float reg_M[WAVE_M_ITERS * THREAD_M];
+  float reg_N[WAVE_N_ITERS * THREAD_N];
+
+  for (int k = 0; k < BLOCK_K; k++) {
+    for (int m_iter = 0; m_iter < WAVE_M_ITERS; m_iter++) {
+      for (int i = 0; i < THREAD_M; i++) {
+        // reg_M[m_iter * THREAD_M + i] -> As[k, 当前 wave 子块内的实际 row].
+        reg_M[m_iter * THREAD_M + i] =
+            A_shared[k * BLOCK_M + wave_row * WAVE_M + m_iter * SUB_M + thread_row * THREAD_M + i];
+      }
+    }
+    for (int n_iter = 0; n_iter < WAVE_N_ITERS; n_iter++) {
+      for (int i = 0; i < THREAD_N; i++) {
+        // reg_N[n_iter * THREAD_N + i] -> Bs[k, 当前 wave 子块内的实际 col].
+        reg_N[n_iter * THREAD_N + i] =
+            B_shared[k * BLOCK_N + wave_col * WAVE_N + n_iter * SUB_N + thread_col * THREAD_N + i];
+      }
+    }
+    // 固定 k, A[:, k] 与 B[k, :] 做外积, 复用于所有子块.
+    for (int m_iter = 0; m_iter < WAVE_M_ITERS; m_iter++) {
+      for (int n_iter = 0; n_iter < WAVE_N_ITERS; n_iter++) {
+        for (int m = 0; m < THREAD_M; m++) {
+          for (int n = 0; n < THREAD_N; n++) {
+            const int index =
+                (m_iter * THREAD_M + m) * (WAVE_N_ITERS * THREAD_N) + n_iter * THREAD_N + n;
+            thread_res[index] += reg_M[m_iter * THREAD_M + m] * reg_N[n_iter * THREAD_N + n];
+          }
+        }
+      }
+    }
+  }
+}
+
+}  // namespace sgemm_opt
+
+/*
+ * SGEMM Opt: C = A * B, 支持 FP32, FP16 存储, 使用 FP32 LDS 与 FMA 累加.
+ * A: [M, K], B: [K, N], C: [M, N], 行主序且使用独立缓冲区.
+ *
+ * 参考 Simon Boehm 的 V11, V12 双缓冲与 wave 分块:
+ * https://github.com/siboehm/SGEMM_CUDA/blob/master/src/kernels/11_kernel_double_buffering.cuh
+ * https://github.com/siboehm/SGEMM_CUDA/blob/master/src/kernels/12_kernel_double_buffering.cuh
+ * Copyright (c) 2023 Simon Boehm, MIT License, 见 LICENSES/SGEMM_CUDA.txt.
+ *
+ * gfx1151 实测按存储精度选择流水线, if constexpr 在编译期消除另一条分支.
+ * FP32 沿用 V11 的半 block 加载与计算分工, FP16 采用 V12 思路的寄存器预取.
+ * FP16 路径以软件预取替代 CUDA 异步拷贝与 barrier API, LDS 仍使用 FP32.
+ * 预取的加载等待位置由编译器调度决定, 不保证原版硬件异步拷贝的重叠效果.
+ * 1. 向量加载首个 K tile, A 转置存入 LDS, B 保持行主序.
+ * 2. 用两套 LDS 交替加载与计算, wave 内按 K 顺序累加寄存器外积.
+ * 3. block 同步保证下一 tile 就绪, 所有线程在相同位置参与同步.
+ * 4. 将 FP32 累加结果转为 T, 四个元素一组写回 C.
+ *
+ * T: float 或 __half; 每个全局向量含四个元素, 分别要求 16 或 8 字节对齐.
+ * BLOCK_M, BLOCK_N, BLOCK_K: block 的输出行数, 输出列数和每轮 K 长度.
+ * WAVE_M, WAVE_N, WAVE_N_ITERS: wave 输出 tile 与沿 col 的子块数.
+ * THREAD_M, THREAD_N: 每线程在一个子块中计算的输出行数和列数.
+ * BLOCK_SIZE: block 线程数, 等于 (BLOCK_M / WAVE_M) * (BLOCK_N / WAVE_N) * 32.
+ * 启动 grid(N / BLOCK_N, M / BLOCK_M), block(BLOCK_SIZE), shape 须覆盖完整 tile.
+ */
+template <typename T, int BLOCK_M, int BLOCK_N, int BLOCK_K, int WAVE_M, int WAVE_N,
+          int WAVE_N_ITERS, int THREAD_M, int THREAD_N, int BLOCK_SIZE>
+__global__ void __launch_bounds__(BLOCK_SIZE)
+    sgemm_opt_kernel(const T* __restrict__ A, const T* __restrict__ B, T* __restrict__ C, int M,
+                     int N, int K) {
+  using Vec = vec_n_t<T, 4>;
+  constexpr int WAVE_SIZE = 32;
+  constexpr int WAVE_M_ITERS = WAVE_M * WAVE_N / (WAVE_SIZE * THREAD_M * THREAD_N * WAVE_N_ITERS);
+  constexpr int SUB_M = WAVE_M / WAVE_M_ITERS;
+  constexpr int SUB_N = WAVE_N / WAVE_N_ITERS;
+
+  const int wave_id = threadIdx.x / WAVE_SIZE;
+  const int wave_col = wave_id % (BLOCK_N / WAVE_N);
+  const int wave_row = wave_id / (BLOCK_N / WAVE_N);
+  const int lane_id = threadIdx.x % WAVE_SIZE;
+  const int thread_col = lane_id % (SUB_N / THREAD_N);
+  const int thread_row = lane_id / (SUB_N / THREAD_N);
+
+  // 两套 FP32 LDS tile, 计算与加载使用不同缓冲区.
+  __shared__ float A_shared[2 * BLOCK_M * BLOCK_K];
+  __shared__ float B_shared[2 * BLOCK_K * BLOCK_N];
+  const T* A_ptr = A + blockIdx.y * BLOCK_M * K;
+  const T* B_ptr = B + blockIdx.x * BLOCK_N;
+  T* C_ptr =
+      C + (blockIdx.y * BLOCK_M + wave_row * WAVE_M) * N + blockIdx.x * BLOCK_N + wave_col * WAVE_N;
+
+  float thread_res[WAVE_M_ITERS * THREAD_M * WAVE_N_ITERS * THREAD_N] = {0.0f};
+  if constexpr (std::is_same_v<T, float>) {
+    constexpr int LOAD_THREADS = BLOCK_SIZE / 2;
+    const int load_tid = threadIdx.x % LOAD_THREADS;
+    const bool back_group = threadIdx.x >= LOAD_THREADS;
+    const auto load = [&](const T* next_A, const T* next_B, float* next_As, float* next_Bs) {
+      sgemm_opt::load_tile<T, BLOCK_M, BLOCK_N, BLOCK_K, LOAD_THREADS>(next_A, next_B, next_As,
+                                                                       next_Bs, N, K, load_tid);
+    };
+    const auto process = [&](const float* As, const float* Bs) {
+      sgemm_opt::process_tile<BLOCK_M, BLOCK_N, BLOCK_K, WAVE_M, WAVE_N, WAVE_N_ITERS, THREAD_M,
+                              THREAD_N>(As, Bs, thread_res, wave_row, wave_col, thread_row,
+                                        thread_col);
+    };
+    if (!back_group) load(A_ptr, B_ptr, A_shared, B_shared);
+    __syncthreads();
+
+    for (int bkIdx = 0; bkIdx < K; bkIdx += 2 * BLOCK_K) {
+      // 前半组计算 tile 0, 后半组加载 tile 1, 两组访问不同 LDS 缓冲区.
+      if (!back_group)
+        process(A_shared, B_shared);
+      else if (bkIdx + BLOCK_K < K) {
+        load(A_ptr + BLOCK_K, B_ptr + BLOCK_K * N, A_shared + BLOCK_M * BLOCK_K,
+             B_shared + BLOCK_K * BLOCK_N);
+      }
+      __syncthreads();
+
+      // 后半组计算 tile 0, 前半组计算 tile 1, 各线程仍按 K 顺序累加自己的输出.
+      if (back_group)
+        process(A_shared, B_shared);
+      else if (bkIdx + BLOCK_K < K) {
+        process(A_shared + BLOCK_M * BLOCK_K, B_shared + BLOCK_K * BLOCK_N);
+      }
+      __syncthreads();
+
+      // 前半组加载 tile 2 到缓冲区 0, 后半组完成 tile 1, 同步后进入下一对 tile.
+      if (!back_group && bkIdx + 2 * BLOCK_K < K) {
+        load(A_ptr + 2 * BLOCK_K, B_ptr + 2 * BLOCK_K * N, A_shared, B_shared);
+      } else if (back_group && bkIdx + BLOCK_K < K) {
+        process(A_shared + BLOCK_M * BLOCK_K, B_shared + BLOCK_K * BLOCK_N);
+      }
+      __syncthreads();
+      A_ptr += 2 * BLOCK_K;
+      B_ptr += 2 * BLOCK_K * N;
+    }
+  } else {
+    int read_buffer = 0;
+    // 全局预取向量在计算期间保留在寄存器, thread_res 跨整个 K 维保留累加结果.
+    sgemm_opt::PackedVec<T> prefetch_A[BLOCK_M * BLOCK_K / (BLOCK_SIZE * 4)];
+    sgemm_opt::PackedVec<T> prefetch_B[BLOCK_K * BLOCK_N / (BLOCK_SIZE * 4)];
+
+    sgemm_opt::prefetch_tile<T, BLOCK_M, BLOCK_N, BLOCK_K, BLOCK_SIZE>(A_ptr, B_ptr, N, K,
+                                                                       prefetch_A, prefetch_B);
+    sgemm_opt::store_tile<T, BLOCK_M, BLOCK_N, BLOCK_K, BLOCK_SIZE>(
+        prefetch_A, prefetch_B, A_shared, B_shared, threadIdx.x);
+    __syncthreads();
+
+    for (int bkIdx = 0; bkIdx < K; bkIdx += BLOCK_K) {
+      const bool has_next = bkIdx + BLOCK_K < K;
+      if (has_next) {
+        // 先发出下一轮读取, 当前 tile 的计算不依赖这些预取结果.
+        sgemm_opt::prefetch_tile<T, BLOCK_M, BLOCK_N, BLOCK_K, BLOCK_SIZE>(
+            A_ptr + BLOCK_K, B_ptr + BLOCK_K * N, N, K, prefetch_A, prefetch_B);
+      }
+      sgemm_opt::process_tile<BLOCK_M, BLOCK_N, BLOCK_K, WAVE_M, WAVE_N, WAVE_N_ITERS, THREAD_M,
+                              THREAD_N>(A_shared + read_buffer * BLOCK_M * BLOCK_K,
+                                        B_shared + read_buffer * BLOCK_K * BLOCK_N, thread_res,
+                                        wave_row, wave_col, thread_row, thread_col);
+      if (has_next) {
+        // 空 asm 约束打包数据的拆分与转换时机, 加载等待仍由编译器安排.
+#pragma unroll
+        for (int i = 0; i < BLOCK_M * BLOCK_K / (BLOCK_SIZE * 4); i++) {
+          asm volatile("" : "+v"(prefetch_A[i].val[0]), "+v"(prefetch_A[i].val[1]) : : "memory");
+        }
+#pragma unroll
+        for (int i = 0; i < BLOCK_K * BLOCK_N / (BLOCK_SIZE * 4); i++) {
+          asm volatile("" : "+v"(prefetch_B[i].val[0]), "+v"(prefetch_B[i].val[1]) : : "memory");
+        }
+        // 写入另一套 LDS, block 同步保证下一轮数据就绪, 且当前缓冲区已读完.
+        sgemm_opt::store_tile<T, BLOCK_M, BLOCK_N, BLOCK_K, BLOCK_SIZE>(
+            prefetch_A, prefetch_B, A_shared + (1 - read_buffer) * BLOCK_M * BLOCK_K,
+            B_shared + (1 - read_buffer) * BLOCK_K * BLOCK_N, threadIdx.x);
+        __syncthreads();
+        read_buffer = 1 - read_buffer;
+        A_ptr += BLOCK_K;
+        B_ptr += BLOCK_K * N;
+      }
+    }
+  }
+
+  for (int m_iter = 0; m_iter < WAVE_M_ITERS; m_iter++) {
+    for (int n_iter = 0; n_iter < WAVE_N_ITERS; n_iter++) {
+      T* C_tile = C_ptr + m_iter * SUB_M * N + n_iter * SUB_N;
+      for (int m = 0; m < THREAD_M; m++) {
+        for (int n = 0; n < THREAD_N; n += 4) {
+          // C_tile[(thread_row * THREAD_M + m) * N + thread_col * THREAD_N + n] -> C[row, col].
+          const int index =
+              (m_iter * THREAD_M + m) * (WAVE_N_ITERS * THREAD_N) + n_iter * THREAD_N + n;
+          Vec values;
+#pragma unroll
+          for (int i = 0; i < 4; i++) values.val[i] = static_cast<T>(thread_res[index + i]);
+          *reinterpret_cast<Vec*>(C_tile + (thread_row * THREAD_M + m) * N + thread_col * THREAD_N +
+                                  n) = values;
         }
       }
     }

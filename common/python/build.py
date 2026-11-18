@@ -28,7 +28,7 @@ def kernel_source(operator: str) -> Path:
         rf'^\s*__global__\s+void\s+{name}_kernel\s*\(', re.MULTILINE,
     )
     candidates = [
-        path for path in sorted((REPO_ROOT / "kernels" / family).glob("*.hip"))
+        path for path in sorted((REPO_ROOT / "hip" / family).glob("*.hip"))
         if path.name != "profiler.hip"
     ]
     sources = [path for path in candidates if launch_entry.search(path.read_text())]
@@ -44,28 +44,33 @@ def kernel_source(operator: str) -> Path:
 def load_kernel(operator: str) -> ctypes.CDLL:
     """编译并加载算子所属的源文件, 返回 ctypes.CDLL 共享库对象.
 
-    GPU_ARCH 指定目标架构, 默认 gfx1151; 同一源文件和架构在进程内复用缓存.
+    GPU_ARCH 默认 gfx1151, GPU_MODE 可取 cu 或 wgp, 默认 wgp.
+    同一源文件, 架构和编译模式在进程内复用缓存.
     """
     source = kernel_source(operator)
     arch = os.environ.get("GPU_ARCH", "gfx1151")
     if not re.fullmatch(r"gfx[0-9a-f]+", arch):
         raise ValueError(f"Invalid GPU_ARCH: {arch}")
-    return _load_source(source, arch)
+    mode = os.environ.get("GPU_MODE", "wgp")
+    if mode not in ("cu", "wgp"):
+        raise ValueError(f"Invalid GPU_MODE: {mode}")
+    return _load_source(source, arch, mode)
 
 
 @lru_cache(maxsize=None)
-def _load_source(source: Path, arch: str) -> ctypes.CDLL:
+def _load_source(source: Path, arch: str, mode: str) -> ctypes.CDLL:
     """调用项目 hipcc 编译指定源文件和架构, 加载并缓存共享库.
 
     编译失败时抛出包含编译器输出的 RuntimeError.
     """
-    relative = source.relative_to(REPO_ROOT / "kernels").with_suffix(".so")
-    library = REPO_ROOT / "build/hip" / relative
+    relative = source.relative_to(REPO_ROOT / "hip").with_suffix(".so")
+    library = REPO_ROOT / "build/hip" / arch / mode / relative
     library.parent.mkdir(parents=True, exist_ok=True)
     result = subprocess.run(
         [
             str(REPO_ROOT / ".venv/bin/hipcc"),
             "-O3", "-std=c++17", f"--offload-arch={arch}",
+            "-mcumode" if mode == "cu" else "-mno-cumode",
             "-shared", "-fPIC",
             str(source), "-o", str(library),
         ],

@@ -30,7 +30,7 @@ def main() -> None:
     result = subprocess.run(
         [
             "git", "ls-files", "--cached", "--others", "--exclude-standard",
-            "-z", "--", "kernels", "common/hip",
+            "-z", "--", "hip", "common/hip",
         ],
         cwd=REPO_ROOT,
         check=True,

@@ -28,7 +28,7 @@ while (($#)); do
 done
 
 [[ -x "$formatter" ]] || {
-    printf '%s\n' 'clang-format is missing. Install requirements-format.txt into .venv.' >&2
+    printf '%s\n' 'clang-format is missing. Install requirements.txt into .venv.' >&2
     exit 1
 }
 
