@@ -1,2 +1,0 @@
-# Matches vLLM's official clang-format pre-commit hook.
-clang-format==23.1.3

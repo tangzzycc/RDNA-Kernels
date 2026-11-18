@@ -4,7 +4,7 @@ set -euo pipefail
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 gpu_arch="${GPU_ARCH:-gfx1151}"
 device="${HIP_VISIBLE_DEVICES:-0}"
-M=5120 N=5120 K=5120
+M=8192 N=8192 K=8192
 warmup=3 iterations=3 batches=3
 top=5 run_timeout=30 compile_jobs=4
 output="" config_file=""
@@ -29,7 +29,7 @@ timing. Remeasure the fastest configurations alongside tuned V9, V6 and the
 initial V10 configuration. Compile in CPU batches, then measure on the GPU.
 
 Options:
-  --shape M N K      Matrix dimensions (default: 5120 5120 5120)
+  --shape M N K      Matrix dimensions (default: 8192 8192 8192)
   --device ID        HIP GPU index (default: HIP_VISIBLE_DEVICES, or 0)
   --output DIR       Result directory (default: timestamped tests/results directory)
   --configs FILE     Search a whitespace-separated list of nine template parameters:
@@ -87,11 +87,11 @@ build_dir="$repo_root/build/hip/matmul/sgemm_v10_autotune/$run_id"
 mkdir -p -- "$build_dir" "$output/configs" "$output/confirm"
 
 # 同一轮使用源码快照, 各配置独立编译, 不通过 sed 修改 kernel.
-for source in kernels/matmul/*.hip common/hip/common.h; do
+for source in hip/matmul/*.hip common/hip/common.h; do
     mkdir -p -- "$build_dir/source/$(dirname -- "$source")"
     cp -- "$repo_root/$source" "$build_dir/source/$source"
 done
-driver="$build_dir/source/kernels/matmul/profiler.hip"
+driver="$build_dir/source/hip/matmul/profiler.hip"
 header=$'version\tBM\tBN\tBK\tWM\tWN\tWN_ITERS\tTM\tTN\tthreads\tmean_ms\tTFLOP_s\tVGPR\tLDS_bytes\tscratch_bytes'
 printf '%s\n' "$header" > "$output/results.tsv"
 printf '%s\n' "$header" > "$output/confirm_runs.tsv"
@@ -115,7 +115,7 @@ printf 'GPU=%s, max LDS/block=%s bytes, max threads/block=%s\n' "$actual_arch" "
 printf 'Shape=(%s,%s,%s), target=%s, HIP_VISIBLE_DEVICES=%s\n' "$M" "$N" "$K" "$gpu_arch" "$device"
 {
     printf 'shape=%s,%s,%s\narch=%s\ndevice=%s\nmax_lds=%s\n' "$M" "$N" "$K" "$gpu_arch" "$device" "$max_lds"
-    sha256sum "$build_dir/source/kernels/matmul/"*.hip "$build_dir/source/common/hip/common.h"
+    sha256sum "$build_dir/source/hip/matmul/"*.hip "$build_dir/source/common/hip/common.h"
 } > "$output/config.txt"
 
 valid_config() {

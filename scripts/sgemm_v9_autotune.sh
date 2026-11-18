@@ -4,7 +4,7 @@ set -euo pipefail
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 gpu_arch="${GPU_ARCH:-gfx1151}"
 device="${HIP_VISIBLE_DEVICES:-0}"
-M=5120 N=5120 K=5120
+M=8192 N=8192 K=8192
 warmup=3 iterations=3 batches=3
 top=5 run_timeout=30
 output=""
@@ -27,7 +27,7 @@ check every output against V4, and rank HIP event timings. Repeat the fastest
 configurations in rotating order with V6 as a baseline.
 
 Options:
-  --shape M N K     Matrix dimensions (default: 5120 5120 5120)
+  --shape M N K     Matrix dimensions (default: 8192 8192 8192)
   --device ID       HIP GPU index (default: HIP_VISIBLE_DEVICES, or 0)
   --output DIR      Result directory (default: timestamped tests/results directory)
   --top N           Number of finalists to remeasure (default: 5)
@@ -77,11 +77,11 @@ output="$(cd -- "$output" && pwd)"
 build_dir="$repo_root/build/hip/matmul/sgemm_v9_autotune/$run_id"
 mkdir -p -- "$build_dir" "$output/configs" "$output/confirm"
 # 一轮搜索使用同一份源码, 避免期间的编辑混入不同配置的结果.
-for source in kernels/matmul/*.hip common/hip/common.h; do
+for source in hip/matmul/*.hip common/hip/common.h; do
     mkdir -p -- "$build_dir/source/$(dirname -- "$source")"
     cp -- "$repo_root/$source" "$build_dir/source/$source"
 done
-driver="$build_dir/source/kernels/matmul/profiler.hip"
+driver="$build_dir/source/hip/matmul/profiler.hip"
 header=$'version\tBM\tBN\tBK\tTM\tTN\tthreads\tmean_ms\tTFLOP_s\tVGPR\tLDS_bytes\tscratch_bytes'
 printf '%s\n' "$header" > "$output/results.tsv"
 printf '%s\n' "$header" > "$output/confirm_runs.tsv"
@@ -104,7 +104,7 @@ printf 'GPU=%s, max LDS/block=%s bytes, max threads/block=%s\n' \
 printf 'Shape=(%s,%s,%s), target=%s, HIP_VISIBLE_DEVICES=%s\n' "$M" "$N" "$K" "$gpu_arch" "$device"
 {
     printf 'shape=%s,%s,%s\narch=%s\ndevice=%s\nmax_lds=%s\n' "$M" "$N" "$K" "$gpu_arch" "$device" "$max_lds"
-    sha256sum "$build_dir/source/kernels/matmul/"*.hip "$build_dir/source/common/hip/common.h"
+    sha256sum "$build_dir/source/hip/matmul/"*.hip "$build_dir/source/common/hip/common.h"
 } > "$output/config.txt"
 
 total=$((${#BK_VALUES[@]} * ${#TM_VALUES[@]} * ${#TN_VALUES[@]} * ${#BM_VALUES[@]} * ${#BN_VALUES[@]} * ${#NUM_THREADS_VALUES[@]}))
